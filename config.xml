@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+    <package_name>rand</package_name>
+    <repository>https://crates.io</repository>
+    <test_mode>false</test_mode>
+    <package_version>0.8.5</package_version>
+    <output_file>rand_graph.svg</output_file>
+    <ascii_tree>true</ascii_tree>
+    <filter_substring>dev</filter_substring>
+</config>

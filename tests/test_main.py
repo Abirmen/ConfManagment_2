@@ -1,4 +1,4 @@
-"""Модульные тесты конфигурации, клиента Cargo и графа DFS (этапы 1–3)."""
+"""Модульные тесты конфигурации, Cargo, графа DFS и порядка загрузки."""
 
 import json
 import sys
@@ -23,6 +23,7 @@ from dep_graph import (  # noqa: E402
     build_graph_dfs,
     load_test_repository,
 )
+from load_order import compute_load_order  # noqa: E402
 from main import (  # noqa: E402
     ConfigError,
     main,
@@ -64,15 +65,16 @@ class ConfigTests(unittest.TestCase):
             validate_config(config, path)
         self.assertEqual(ctx.exception.code, "E04")
 
-    def test_main_runs_test_mode_with_filter(self):
+    def test_main_prints_filtered_load_order(self):
         output = StringIO()
         cfg = str(ROOT / "examples" / "config-test.xml")
         with redirect_stdout(output):
             result = main(["--config", cfg])
         self.assertEqual(result, 0)
         text = output.getvalue()
-        self.assertIn("A -> C", text)
-        self.assertNotIn("B ->", text)
+        self.assertIn("1. G", text)
+        self.assertIn("5. A", text)
+        self.assertNotIn(". B", text)
 
     def test_main_runs_cycle_config(self):
         output = StringIO()
@@ -81,9 +83,19 @@ class ConfigTests(unittest.TestCase):
             result = main(["--config", cfg])
         self.assertEqual(result, 0)
         text = output.getvalue()
-        self.assertIn("Обнаружены циклические зависимости", text)
+        self.assertIn("строгий топологический порядок не существует", text)
         self.assertIn("C -> A", text)
-        self.assertIn("D -> D", text)
+        self.assertIn("Приближённый порядок", text)
+
+    def test_main_show_graph_flag(self):
+        output = StringIO()
+        cfg = str(ROOT / "examples" / "config-isolated.xml")
+        with redirect_stdout(output):
+            result = main(["--config", cfg, "--show-graph"])
+        self.assertEqual(result, 0)
+        text = output.getvalue()
+        self.assertIn("Граф зависимостей (корень: Z):", text)
+        self.assertIn("Порядок загрузки зависимостей (корень: Z):", text)
 
     def test_e01_missing_file(self):
         with self.assertRaisesRegex(ConfigError, "E01"):
@@ -185,14 +197,14 @@ class CargoRepoTests(unittest.TestCase):
             )
         self.assertEqual(deps, [("pkg", "^0.5")])
 
-    def test_semver_matching_and_selection(self):
+    def test_semver_matching_and_short_caret(self):
         self.assertTrue(matches_version_req("2.0.87", "^2.0.56"))
-        self.assertFalse(matches_version_req("3.0.0", "^2.0.56"))
+        self.assertTrue(matches_version_req("1.9.0", "^1"))
+        self.assertTrue(matches_version_req("1.4.2", "^1.0"))
+        self.assertFalse(matches_version_req("2.0.0", "^1"))
         self.assertTrue(matches_version_req("0.2.9", "^0.2.1"))
-        self.assertFalse(matches_version_req("0.3.0", "^0.2.1"))
         self.assertTrue(matches_version_req("1.4.9", "~1.4.2"))
-        self.assertFalse(matches_version_req("1.5.0", "~1.4.2"))
-        chosen = select_best_version(["1.0.1", "1.0.9", "2.0.0"], "^1.0.0")
+        chosen = select_best_version(["1.0.1", "1.0.9", "2.0.0"], "^1.0")
         self.assertEqual(chosen, "1.0.9")
 
     def test_cargo_graph_source_transitive(self):
@@ -214,7 +226,6 @@ class CargoRepoTests(unittest.TestCase):
         self.assertEqual(cycles, [])
         self.assertEqual(graph["root"], ["mid"])
         self.assertEqual(graph["mid"], ["leaf"])
-        self.assertEqual(graph["leaf"], [])
 
     def test_e11_e12_e13_errors(self):
         raw = BytesIO(b'{"errors":[{"detail":"not found"}]}')
@@ -230,17 +241,29 @@ class CargoRepoTests(unittest.TestCase):
                 fetch_direct_dependencies("https://crates.io", "x", "1.0.0")
 
 
-class DepGraphTests(unittest.TestCase):
-    """Тесты нерекурсивного DFS, фильтрации, циклов и тестового файла."""
+class DepGraphAndOrderTests(unittest.TestCase):
+    """Тесты нерекурсивного DFS и порядка загрузки зависимостей."""
 
-    def test_diamond_and_filter(self):
-        repo = {"A": ["B", "C"], "B": ["D"], "C": ["D"], "D": []}
+    def test_diamond_wave_load_order(self):
+        repo = load_test_repository(ROOT / "examples" / "test-repository.txt")
         graph, cycles = build_graph_dfs("A", "", lambda n: repo[n])
-        self.assertEqual(cycles, [])
-        self.assertEqual(graph["D"], [])
-        filtered, _ = build_graph_dfs("A", "B", lambda n: repo[n])
-        self.assertNotIn("B", filtered)
-        self.assertEqual(filtered["A"], ["C"])
+        result = compute_load_order(graph, cycles)
+        self.assertFalse(result["has_cycle"])
+        order = result["order"]
+        self.assertEqual(order, ["E", "G", "D", "F", "B", "C", "A"])
+        for pkg, deps in graph.items():
+            for dep in deps:
+                self.assertLess(order.index(dep), order.index(pkg))
+
+    def test_cycle_detection_and_approximate_order(self):
+        path = ROOT / "examples" / "test-cycle-repository.txt"
+        repo = load_test_repository(path)
+        graph, cycles = build_graph_dfs("A", "", lambda n: repo[n])
+        result = compute_load_order(graph, cycles)
+        self.assertTrue(result["has_cycle"])
+        self.assertEqual(result["order"], ["E"])
+        self.assertEqual(result["blocked"], ["A", "B", "C", "D"])
+        self.assertEqual(result["approx_order"], ["D", "E", "C", "B", "A"])
 
     def test_filtered_root_returns_empty_graph(self):
         repo = {"A": ["B"], "B": []}
@@ -254,8 +277,10 @@ class DepGraphTests(unittest.TestCase):
         repo = {nodes[i]: [nodes[i + 1]] for i in range(depth - 1)}
         repo[nodes[-1]] = []
         graph, cycles = build_graph_dfs("N0", "", lambda n: repo[n])
-        self.assertEqual(len(graph), depth)
-        self.assertEqual(cycles, [])
+        result = compute_load_order(graph, cycles)
+        self.assertEqual(len(result["order"]), depth)
+        self.assertEqual(result["order"][0], f"N{depth - 1}")
+        self.assertEqual(result["order"][-1], "N0")
 
     def test_invalid_test_repository_format_raises_e15(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -1,4 +1,4 @@
-"""Точка входа CLI, проверка XML и построение графа (этап 3)."""
+"""Точка входа CLI, проверка XML и порядок загрузки (этап 4)."""
 
 import argparse
 import re
@@ -14,6 +14,7 @@ from dep_graph import (
     format_graph_report,
     load_test_repository,
 )
+from load_order import format_load_order_report
 
 
 FIELDS = (
@@ -139,9 +140,10 @@ def build_from_test_repo(config, config_path):
     if root not in repo_map:
         msg = f"Пакет '{root}' отсутствует в тестовом репозитории"
         raise RepoError("E11", msg)
-    return build_graph_dfs(
+    graph, cycles = build_graph_dfs(
         root, config["filter_substring"], lambda pkg: repo_map.get(pkg, [])
     )
+    return graph, cycles, None
 
 
 def build_from_cargo_repo(config):
@@ -151,31 +153,45 @@ def build_from_cargo_repo(config):
         config["package_name"],
         config["package_version"],
     )
-    return build_graph_dfs(
+    graph, cycles = build_graph_dfs(
         config["package_name"], config["filter_substring"], source.neighbors
     )
+    return graph, cycles, source.resolved
 
 
-def run_stage_three(config, config_path):
-    """Выполняет построение графа и выводит результат анализа."""
+def run_stage_four(config, config_path, show_graph=False):
+    """Вычисляет и выводит порядок загрузки зависимостей пакета."""
     if config["test_mode"]:
-        graph, cycles = build_from_test_repo(config, config_path)
+        graph, cycles, versions = build_from_test_repo(config, config_path)
     else:
-        graph, cycles = build_from_cargo_repo(config)
-    print(format_graph_report(config["package_name"], graph, cycles))
+        graph, cycles, versions = build_from_cargo_repo(config)
+    root = config["package_name"]
+    if show_graph:
+        print(format_graph_report(root, graph, cycles))
+    print(format_load_order_report(root, graph, cycles, versions))
 
 
-def main(argv=None):
-    """Точка входа CLI для построения графа зависимостей (этап 3)."""
-    parser = argparse.ArgumentParser(description="Вариант 2 — этап 3")
+def build_arg_parser():
+    """Создаёт парсер аргументов командной строки для этапа 4."""
+    parser = argparse.ArgumentParser(description="Вариант 2 — этап 4")
     parser.add_argument(
         "--config", default="config.xml", help="Путь к XML-конфигурации"
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--show-graph",
+        action="store_true",
+        help="Дополнительно вывести список смежности графа",
+    )
+    return parser
+
+
+def main(argv=None):
+    """Точка входа CLI для вывода порядка загрузки зависимостей."""
+    args = build_arg_parser().parse_args(argv)
     try:
         path = Path(args.config).expanduser().resolve()
         config = validate_config(read_config(path), path)
-        run_stage_three(config, path)
+        run_stage_four(config, path, show_graph=args.show_graph)
     except (ConfigError, RepoError) as exc:
         print(f"Ошибка {exc}", file=sys.stderr)
         return 1

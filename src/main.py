@@ -1,9 +1,13 @@
+"""Точка входа CLI и проверка XML-конфигурации (этап 2)."""
+
 import argparse
 import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import urlparse
+
+from cargo_repo import RepoError, fetch_direct_dependencies
 
 
 FIELDS = (
@@ -109,9 +113,37 @@ def validate_config(config, config_path):
     return config
 
 
+def format_direct_dependencies(package_name, version, dependencies):
+    """Форматирует прямые зависимости пакета для вывода в консоль."""
+    header = f"Прямые зависимости {package_name} {version}:"
+    if not dependencies:
+        return f"{header} отсутствуют"
+    lines = [header]
+    for dep_name, version_req in dependencies:
+        lines.append(f"- {dep_name} ({version_req})")
+    return "\n".join(lines)
+
+
+def run_stage_two(config):
+    """Загружает и выводит прямые зависимости пакета Cargo."""
+    if config["test_mode"]:
+        msg = "Режим тестового репозитория реализуется на этапе 3"
+        raise RepoError("E14", msg)
+    deps = fetch_direct_dependencies(
+        config["repository"],
+        config["package_name"],
+        config["package_version"],
+    )
+    print(
+        format_direct_dependencies(
+            config["package_name"], config["package_version"], deps
+        )
+    )
+
+
 def main(argv=None):
-    """Точка входа; печатает конфигурацию в формате ключ: значение."""
-    parser = argparse.ArgumentParser(description="Вариант 2 — этап 1")
+    """Точка входа; проверяет XML и выводит прямые зависимости пакета."""
+    parser = argparse.ArgumentParser(description="Вариант 2 — этап 2")
     parser.add_argument(
         "--config", default="config.xml", help="Путь к XML-конфигурации"
     )
@@ -119,14 +151,10 @@ def main(argv=None):
     try:
         path = Path(args.config).expanduser().resolve()
         config = validate_config(read_config(path), path)
-    except ConfigError as exc:
+        run_stage_two(config)
+    except (ConfigError, RepoError) as exc:
         print(f"Ошибка {exc}", file=sys.stderr)
         return 1
-
-    for key in FIELDS:
-        value = config[key]
-        display = str(value).lower() if isinstance(value, bool) else value
-        print(f"{key}: {display}")
     return 0
 
 

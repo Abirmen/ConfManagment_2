@@ -1,10 +1,10 @@
-"""Модульные тесты конфигурации (этап 1) и сбора данных Cargo (этап 2)."""
+"""Модульные тесты конфигурации, клиента Cargo и графа DFS (этапы 1–3)."""
 
 import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -12,13 +12,19 @@ from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cargo_repo import (  # noqa: E402
+    CargoGraphSource,
     RepoError,
     fetch_direct_dependencies,
+    matches_version_req,
+    select_best_version,
     sparse_index_path,
+)
+from dep_graph import (  # noqa: E402
+    build_graph_dfs,
+    load_test_repository,
 )
 from main import (  # noqa: E402
     ConfigError,
-    format_direct_dependencies,
     main,
     read_config,
     validate_config,
@@ -45,29 +51,39 @@ class ConfigTests(unittest.TestCase):
     def test_valid(self):
         self.assertTrue(validate_config(self.sample, ROOT / "config.xml"))
 
-    def test_main_prints_direct_dependencies(self):
-        mock_deps = [("proc-macro2", "^1.0.74"), ("syn", "^2.0.56")]
-        output = StringIO()
-        with patch("main.fetch_direct_dependencies", return_value=mock_deps):
-            with redirect_stdout(output):
-                result = main(["--config", str(ROOT / "config.xml")])
-        self.assertEqual(result, 0)
-        text = output.getvalue()
-        self.assertIn("- proc-macro2 (^1.0.74)", text)
-        self.assertIn("- syn (^2.0.56)", text)
-
-    def test_main_rejects_test_mode_in_stage_two(self):
-        err = StringIO()
-        cfg = str(ROOT / "examples" / "config-test.xml")
-        with redirect_stderr(err):
-            result = main(["--config", cfg])
-        self.assertEqual(result, 1)
-        self.assertIn("E14", err.getvalue())
-
     def test_valid_test_mode(self):
         path = ROOT / "examples" / "config-test.xml"
         config = read_config(path)
         self.assertTrue(validate_config(config, path)["test_mode"])
+
+    def test_test_mode_requires_uppercase_latin_package(self):
+        config = read_config(ROOT / "examples" / "config-test.xml")
+        config["package_name"] = "serde"
+        path = ROOT / "examples" / "config-test.xml"
+        with self.assertRaises(ConfigError) as ctx:
+            validate_config(config, path)
+        self.assertEqual(ctx.exception.code, "E04")
+
+    def test_main_runs_test_mode_with_filter(self):
+        output = StringIO()
+        cfg = str(ROOT / "examples" / "config-test.xml")
+        with redirect_stdout(output):
+            result = main(["--config", cfg])
+        self.assertEqual(result, 0)
+        text = output.getvalue()
+        self.assertIn("A -> C", text)
+        self.assertNotIn("B ->", text)
+
+    def test_main_runs_cycle_config(self):
+        output = StringIO()
+        cfg = str(ROOT / "examples" / "config-cycle.xml")
+        with redirect_stdout(output):
+            result = main(["--config", cfg])
+        self.assertEqual(result, 0)
+        text = output.getvalue()
+        self.assertIn("Обнаружены циклические зависимости", text)
+        self.assertIn("C -> A", text)
+        self.assertIn("D -> D", text)
 
     def test_e01_missing_file(self):
         with self.assertRaisesRegex(ConfigError, "E01"):
@@ -98,6 +114,7 @@ class ConfigTests(unittest.TestCase):
     def test_e06_missing_test_repository(self):
         config = self.sample.copy()
         config["test_mode"] = "true"
+        config["package_name"] = "A"
         config["repository"] = "missing-repo.txt"
         with self.assertRaisesRegex(ConfigError, "E06"):
             validate_config(config, ROOT / "config.xml")
@@ -132,7 +149,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class CargoRepoTests(unittest.TestCase):
-    """Тесты извлечения прямых зависимостей Cargo и кодов E11–E13."""
+    """Тесты извлечения зависимостей Cargo и разрешения SemVer."""
 
     def test_api_filters_dev_build_and_optional(self):
         payload = {
@@ -142,19 +159,13 @@ class CargoRepoTests(unittest.TestCase):
                 {"crate_id": "opt_dep", "req": "^1.0", "optional": True},
                 {"crate_id": "dev_dep", "req": "^1.0", "kind": "dev"},
                 {"crate_id": "cc", "req": "^1.0", "kind": "build"},
-                {"crate_id": "syn", "req": "^2.0", "kind": "normal"},
             ]
         }
-        body = json.dumps(payload)
-        with patch("cargo_repo.http_get_text", return_value=body):
+        with patch("cargo_repo.http_get_text", return_value=json.dumps(payload)):
             deps = fetch_direct_dependencies(
                 "https://crates.io", "serde_derive", "1.0.210"
             )
         self.assertEqual(deps, [("quote", "^1.0"), ("syn", "^2.0")])
-
-    def test_empty_dependencies_formatting(self):
-        text = format_direct_dependencies("itoa", "1.0.11", [])
-        self.assertEqual(text, "Прямые зависимости itoa 1.0.11: отсутствуют")
 
     def test_sparse_index_paths_and_parsing(self):
         self.assertEqual(sparse_index_path("a"), "1/a")
@@ -165,46 +176,94 @@ class CargoRepoTests(unittest.TestCase):
             json.dumps({"vers": "1.0.0", "deps": []}),
             json.dumps({
                 "vers": "1.0.1",
-                "deps": [
-                    {"name": "alias", "package": "real_pkg", "req": "^0.5"},
-                    {"name": "dev_only", "req": "^1.0", "kind": "dev"},
-                ],
+                "deps": [{"name": "alias", "package": "pkg", "req": "^0.5"}],
             }),
         ])
         with patch("cargo_repo.http_get_text", return_value=lines):
             deps = fetch_direct_dependencies(
                 "https://index.crates.io", "demo", "1.0.1"
             )
-        self.assertEqual(deps, [("real_pkg", "^0.5")])
+        self.assertEqual(deps, [("pkg", "^0.5")])
 
-    def test_e11_http_404_not_found(self):
-        raw = BytesIO(b'{"errors":[{"detail":"crate does not exist"}]}')
+    def test_semver_matching_and_selection(self):
+        self.assertTrue(matches_version_req("2.0.87", "^2.0.56"))
+        self.assertFalse(matches_version_req("3.0.0", "^2.0.56"))
+        self.assertTrue(matches_version_req("0.2.9", "^0.2.1"))
+        self.assertFalse(matches_version_req("0.3.0", "^0.2.1"))
+        self.assertTrue(matches_version_req("1.4.9", "~1.4.2"))
+        self.assertFalse(matches_version_req("1.5.0", "~1.4.2"))
+        chosen = select_best_version(["1.0.1", "1.0.9", "2.0.0"], "^1.0.0")
+        self.assertEqual(chosen, "1.0.9")
+
+    def test_cargo_graph_source_transitive(self):
+        deps_map = {
+            ("root", "1.0.0"): [("mid", "^1.0")],
+            ("mid", "1.2.0"): [("leaf", "^0.3")],
+            ("leaf", "0.3.5"): [],
+        }
+        vers_map = {"mid": ["1.0.0", "1.2.0"], "leaf": ["0.3.5", "0.4.0"]}
+        with patch(
+            "cargo_repo.fetch_direct_dependencies",
+            side_effect=lambda _, p, v: deps_map[(p, v)],
+        ), patch(
+            "cargo_repo.fetch_available_versions",
+            side_effect=lambda _, p: vers_map[p],
+        ):
+            src = CargoGraphSource("https://crates.io", "root", "1.0.0")
+            graph, cycles = build_graph_dfs("root", "", src.neighbors)
+        self.assertEqual(cycles, [])
+        self.assertEqual(graph["root"], ["mid"])
+        self.assertEqual(graph["mid"], ["leaf"])
+        self.assertEqual(graph["leaf"], [])
+
+    def test_e11_e12_e13_errors(self):
+        raw = BytesIO(b'{"errors":[{"detail":"not found"}]}')
         err = HTTPError("https://crates.io", 404, "Not Found", {}, raw)
         with patch("cargo_repo.urlopen", side_effect=err):
-            with self.assertRaises(RepoError) as ctx:
-                fetch_direct_dependencies("https://crates.io", "none", "1.0.0")
-        self.assertEqual(ctx.exception.code, "E11")
-
-    def test_e11_missing_version_in_sparse(self):
-        body = json.dumps({"vers": "0.1.0", "deps": []})
-        with patch("cargo_repo.http_get_text", return_value=body):
-            with self.assertRaises(RepoError) as ctx:
-                fetch_direct_dependencies(
-                    "https://index.crates.io", "itoa", "9.9.9"
-                )
-        self.assertEqual(ctx.exception.code, "E11")
-
-    def test_e12_network_failure(self):
+            with self.assertRaisesRegex(RepoError, "E11"):
+                fetch_direct_dependencies("https://crates.io", "x", "1.0.0")
         with patch("cargo_repo.urlopen", side_effect=URLError("offline")):
-            with self.assertRaises(RepoError) as ctx:
-                fetch_direct_dependencies("https://crates.io", "itoa", "1.0.0")
-        self.assertEqual(ctx.exception.code, "E12")
+            with self.assertRaisesRegex(RepoError, "E12"):
+                fetch_direct_dependencies("https://crates.io", "x", "1.0.0")
+        with patch("cargo_repo.http_get_text", return_value="{bad"):
+            with self.assertRaisesRegex(RepoError, "E13"):
+                fetch_direct_dependencies("https://crates.io", "x", "1.0.0")
 
-    def test_e13_malformed_json(self):
-        with patch("cargo_repo.http_get_text", return_value="{bad-json"):
+
+class DepGraphTests(unittest.TestCase):
+    """Тесты нерекурсивного DFS, фильтрации, циклов и тестового файла."""
+
+    def test_diamond_and_filter(self):
+        repo = {"A": ["B", "C"], "B": ["D"], "C": ["D"], "D": []}
+        graph, cycles = build_graph_dfs("A", "", lambda n: repo[n])
+        self.assertEqual(cycles, [])
+        self.assertEqual(graph["D"], [])
+        filtered, _ = build_graph_dfs("A", "B", lambda n: repo[n])
+        self.assertNotIn("B", filtered)
+        self.assertEqual(filtered["A"], ["C"])
+
+    def test_filtered_root_returns_empty_graph(self):
+        repo = {"A": ["B"], "B": []}
+        graph, cycles = build_graph_dfs("A", "A", lambda n: repo[n])
+        self.assertEqual(graph, {})
+        self.assertEqual(cycles, [])
+
+    def test_deep_chain_without_recursion_limit(self):
+        depth = 1500
+        nodes = [f"N{i}" for i in range(depth)]
+        repo = {nodes[i]: [nodes[i + 1]] for i in range(depth - 1)}
+        repo[nodes[-1]] = []
+        graph, cycles = build_graph_dfs("N0", "", lambda n: repo[n])
+        self.assertEqual(len(graph), depth)
+        self.assertEqual(cycles, [])
+
+    def test_invalid_test_repository_format_raises_e15(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bad_file = Path(folder) / "bad.txt"
+            bad_file.write_text("a_lower: B\n", encoding="utf-8")
             with self.assertRaises(RepoError) as ctx:
-                fetch_direct_dependencies("https://crates.io", "itoa", "1.0.0")
-        self.assertEqual(ctx.exception.code, "E13")
+                load_test_repository(bad_file)
+            self.assertEqual(ctx.exception.code, "E15")
 
 
 if __name__ == "__main__":

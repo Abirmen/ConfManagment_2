@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+    <package_name>A</package_name>
+    <repository>test-cycle-repository.txt</repository>
+    <test_mode>true</test_mode>
+    <package_version>1.0.0</package_version>
+    <output_file>cycle-graph.svg</output_file>
+    <ascii_tree>false</ascii_tree>
+    <filter_substring></filter_substring>
+</config>

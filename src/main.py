@@ -1,4 +1,4 @@
-"""Точка входа CLI и проверка XML-конфигурации (этап 2)."""
+"""Точка входа CLI, проверка XML и построение графа (этап 3)."""
 
 import argparse
 import re
@@ -7,7 +7,13 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import urlparse
 
-from cargo_repo import RepoError, fetch_direct_dependencies
+from cargo_repo import CargoGraphSource, RepoError
+from dep_graph import (
+    TEST_PKG_RE,
+    build_graph_dfs,
+    format_graph_report,
+    load_test_repository,
+)
 
 
 FIELDS = (
@@ -69,14 +75,20 @@ def parse_boolean(config, field):
     return value == "true"
 
 
+def resolve_test_repo_path(value, config_path):
+    """Вычисляет абсолютный путь к файлу тестового репозитория."""
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = config_path.parent / candidate
+    return candidate.resolve()
+
+
 def validate_repository(value, test_mode, config_path):
     """Проверяет источник относительно режима работы."""
     if not value:
         raise ConfigError("E06", "repository не может быть пустым")
     if test_mode:
-        candidate = Path(value).expanduser()
-        if not candidate.is_absolute():
-            candidate = config_path.parent / candidate
+        candidate = resolve_test_repo_path(value, config_path)
         if not candidate.is_file():
             raise ConfigError("E06", f"Тестовый файл не найден: {candidate}")
     else:
@@ -86,14 +98,20 @@ def validate_repository(value, test_mode, config_path):
             raise ConfigError("E06", "Требуется URL вида https://host/path")
 
 
-def validate_config(config, config_path):
-    """Проверяет значения всех семи полей."""
-    name = config["package_name"]
+def validate_package_name(name, test_mode):
+    """Проверяет имя пакета с учётом ограничений тестового режима."""
     if not PACKAGE_RE.fullmatch(name):
         raise ConfigError("E04", "Неверное имя пакета")
+    if test_mode and not TEST_PKG_RE.fullmatch(name):
+        msg = "В тестовом режиме имя пакета только из заглавных букв A-Z"
+        raise ConfigError("E04", msg)
 
+
+def validate_config(config, config_path):
+    """Проверяет значения всех семи полей."""
     test_mode = parse_boolean(config, "test_mode")
     ascii_tree = parse_boolean(config, "ascii_tree")
+    validate_package_name(config["package_name"], test_mode)
     validate_repository(config["repository"], test_mode, config_path)
 
     if not VERSION_RE.fullmatch(config["package_version"]):
@@ -113,37 +131,43 @@ def validate_config(config, config_path):
     return config
 
 
-def format_direct_dependencies(package_name, version, dependencies):
-    """Форматирует прямые зависимости пакета для вывода в консоль."""
-    header = f"Прямые зависимости {package_name} {version}:"
-    if not dependencies:
-        return f"{header} отсутствуют"
-    lines = [header]
-    for dep_name, version_req in dependencies:
-        lines.append(f"- {dep_name} ({version_req})")
-    return "\n".join(lines)
+def build_from_test_repo(config, config_path):
+    """Строит граф зависимостей по файлу тестового репозитория."""
+    repo_path = resolve_test_repo_path(config["repository"], config_path)
+    repo_map = load_test_repository(repo_path)
+    root = config["package_name"]
+    if root not in repo_map:
+        msg = f"Пакет '{root}' отсутствует в тестовом репозитории"
+        raise RepoError("E11", msg)
+    return build_graph_dfs(
+        root, config["filter_substring"], lambda pkg: repo_map.get(pkg, [])
+    )
 
 
-def run_stage_two(config):
-    """Загружает и выводит прямые зависимости пакета Cargo."""
-    if config["test_mode"]:
-        msg = "Режим тестового репозитория реализуется на этапе 3"
-        raise RepoError("E14", msg)
-    deps = fetch_direct_dependencies(
+def build_from_cargo_repo(config):
+    """Строит транзитивный граф зависимостей из репозитория Cargo."""
+    source = CargoGraphSource(
         config["repository"],
         config["package_name"],
         config["package_version"],
     )
-    print(
-        format_direct_dependencies(
-            config["package_name"], config["package_version"], deps
-        )
+    return build_graph_dfs(
+        config["package_name"], config["filter_substring"], source.neighbors
     )
 
 
+def run_stage_three(config, config_path):
+    """Выполняет построение графа и выводит результат анализа."""
+    if config["test_mode"]:
+        graph, cycles = build_from_test_repo(config, config_path)
+    else:
+        graph, cycles = build_from_cargo_repo(config)
+    print(format_graph_report(config["package_name"], graph, cycles))
+
+
 def main(argv=None):
-    """Точка входа; проверяет XML и выводит прямые зависимости пакета."""
-    parser = argparse.ArgumentParser(description="Вариант 2 — этап 2")
+    """Точка входа CLI для построения графа зависимостей (этап 3)."""
+    parser = argparse.ArgumentParser(description="Вариант 2 — этап 3")
     parser.add_argument(
         "--config", default="config.xml", help="Путь к XML-конфигурации"
     )
@@ -151,7 +175,7 @@ def main(argv=None):
     try:
         path = Path(args.config).expanduser().resolve()
         config = validate_config(read_config(path), path)
-        run_stage_two(config)
+        run_stage_three(config, path)
     except (ConfigError, RepoError) as exc:
         print(f"Ошибка {exc}", file=sys.stderr)
         return 1

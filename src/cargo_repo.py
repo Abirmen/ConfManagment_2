@@ -1,17 +1,23 @@
-"""Получение прямых зависимостей пакетов Rust (Cargo) по HTTP."""
+"""Получение зависимостей и разрешение версий пакетов Rust (Cargo)."""
 
 import json
+import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 
-USER_AGENT = "cargo-dep-visualizer/0.2 (educational-project)"
+USER_AGENT = "cargo-dep-visualizer/0.3 (educational-project)"
 TIMEOUT_SECONDS = 15
+SEMVER_RE = re.compile(
+    r"^([0-9]+)\.([0-9]+)\.([0-9]+)"
+    r"(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+)
+COMP_RE = re.compile(r"^(\^|~|>=|<=|>|<|=)?\s*([0-9]+(?:\.[0-9xX*]+)*)")
 
 
 class RepoError(RuntimeError):
-    """Ошибка обращения к репозиторию Cargo или разбора метаданных."""
+    """Ошибка обращения к репозиторию Cargo или тестовому файлу."""
 
     def __init__(self, code, message):
         super().__init__(f"{code}: {message}")
@@ -39,14 +45,20 @@ def sparse_index_path(package_name):
     return f"{lower[:2]}/{lower[2:4]}/{lower}"
 
 
-def build_api_url(base_url, package_name, version):
-    """Формирует URL запроса зависимостей для HTTP API crates.io."""
+def crate_api_prefix(base_url):
+    """Возвращает базовый префикс `/api/v1/crates` для реестра."""
     clean = base_url.rstrip("/")
+    if clean.endswith("/api/v1/crates"):
+        return clean
+    return f"{clean}/api/v1/crates"
+
+
+def build_api_url(base_url, package_name, version):
+    """Формирует URL запроса зависимостей конкретной версии пакета."""
+    prefix = crate_api_prefix(base_url)
     pkg = quote(package_name, safe="")
     ver = quote(version, safe="")
-    if clean.endswith("/api/v1/crates"):
-        return f"{clean}/{pkg}/{ver}/dependencies"
-    return f"{clean}/api/v1/crates/{pkg}/{ver}/dependencies"
+    return f"{prefix}/{pkg}/{ver}/dependencies"
 
 
 def extract_error_detail(exc):
@@ -89,7 +101,7 @@ def http_get_text(url):
 
 
 def extract_dep_entry(item):
-    """Извлекает имя и версию для обязательной обычной зависимости."""
+    """Извлекает имя и требование к версии для обычной зависимости."""
     if not isinstance(item, dict):
         raise RepoError("E13", "Запись зависимости не является объектом")
     kind = item.get("kind") or "normal"
@@ -129,8 +141,12 @@ def fetch_from_api(base_url, package_name, version):
     return collect_dependencies(data["dependencies"])
 
 
-def parse_sparse_version(body, package_name, version):
-    """Ищет JSON-строку заданной версии пакета в sparse-индексе."""
+def load_sparse_records(base_url, package_name):
+    """Загружает все записи версий пакета из sparse-индекса Cargo."""
+    clean = base_url.rstrip("/")
+    url = f"{clean}/{sparse_index_path(package_name)}"
+    body = http_get_text(url)
+    records = []
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line:
@@ -140,21 +156,20 @@ def parse_sparse_version(body, package_name, version):
         except ValueError as exc:
             msg = "Повреждённая строка JSON в sparse-индексе"
             raise RepoError("E13", msg) from exc
-        if isinstance(record, dict) and record.get("vers") == version:
-            return record
-    msg = f"Версия {version} пакета {package_name} не найдена"
-    raise RepoError("E11", msg)
+        if isinstance(record, dict):
+            records.append(record)
+    return records
 
 
 def fetch_from_sparse(base_url, package_name, version):
-    """Получает прямые зависимости из sparse-индекса Cargo."""
-    clean = base_url.rstrip("/")
-    url = f"{clean}/{sparse_index_path(package_name)}"
-    body = http_get_text(url)
-    record = parse_sparse_version(body, package_name, version)
-    if "deps" not in record:
-        raise RepoError("E13", "В записи индекса отсутствует поле deps")
-    return collect_dependencies(record["deps"])
+    """Получает прямые зависимости конкретной версии из sparse-индекса."""
+    for record in load_sparse_records(base_url, package_name):
+        if record.get("vers") == version:
+            if "deps" not in record:
+                raise RepoError("E13", "В записи индекса нет поля deps")
+            return collect_dependencies(record["deps"])
+    msg = f"Версия {version} пакета {package_name} не найдена"
+    raise RepoError("E11", msg)
 
 
 def fetch_direct_dependencies(repository, package_name, version):
@@ -162,3 +177,161 @@ def fetch_direct_dependencies(repository, package_name, version):
     if is_sparse_repository(repository):
         return fetch_from_sparse(repository, package_name, version)
     return fetch_from_api(repository, package_name, version)
+
+
+def parse_semver(version_str):
+    """Разбирает строку SemVer в кортеж (major, minor, patch, pre)."""
+    match = SEMVER_RE.fullmatch(version_str.strip())
+    if not match:
+        return None
+    major, minor, patch, pre = match.groups()
+    return int(major), int(minor), int(patch), pre or ""
+
+
+def caret_upper_bound(nums):
+    """Вычисляет верхнюю границу диапазона для оператора '^' в Cargo."""
+    padded = (list(nums) + [0, 0, 0])[:3]
+    major, minor, patch = padded[0], padded[1], padded[2]
+    if major > 0:
+        return (major + 1, 0, 0)
+    if len(nums) == 1:
+        return (1, 0, 0)
+    if minor > 0:
+        return (0, minor + 1, 0)
+    if len(nums) == 2:
+        return (0, 1, 0)
+    return (0, 0, patch + 1)
+
+
+def tilde_upper_bound(nums):
+    """Вычисляет верхнюю границу диапазона для оператора '~' в Cargo."""
+    padded = (list(nums) + [0, 0, 0])[:3]
+    if len(nums) == 1:
+        return (padded[0] + 1, 0, 0)
+    return (padded[0], padded[1] + 1, 0)
+
+
+def check_comparator(ver_tuple, token):
+    """Проверяет соответствие версии одному SemVer-компаратору."""
+    clean = token.strip()
+    if not clean or clean == "*":
+        return True
+    match = COMP_RE.match(clean)
+    if not match:
+        return True
+    op = match.group(1) or "^"
+    raw_parts = match.group(2).split(".")
+    nums = [int(p) for p in raw_parts if p.isdigit()]
+    if not nums:
+        return True
+    padded = (nums + [0, 0, 0])[:3]
+    target = (padded[0], padded[1], padded[2])
+    if len(nums) < 3 and op == "=":
+        op = "~" if len(nums) == 2 else "^"
+    if op == "^":
+        return target <= ver_tuple < caret_upper_bound(padded[: len(nums)])
+    if op == "~":
+        return target <= ver_tuple < tilde_upper_bound(nums)
+    ops = {
+        ">=": ver_tuple >= target,
+        "<=": ver_tuple <= target,
+        ">": ver_tuple > target,
+        "<": ver_tuple < target,
+        "=": ver_tuple == target,
+    }
+    return ops.get(op, True)
+
+
+def matches_version_req(version_str, req_str):
+    """Проверяет, удовлетворяет ли стабильная версия строке Cargo req."""
+    parsed = parse_semver(version_str)
+    if parsed is None or parsed[3]:
+        return False
+    ver_tuple = parsed[:3]
+    parts = [part.strip() for part in req_str.split(",") if part.strip()]
+    return all(check_comparator(ver_tuple, part) for part in parts)
+
+
+def fetch_available_versions(repository, package_name):
+    """Возвращает список доступных не-отозванных версий пакета."""
+    if is_sparse_repository(repository):
+        records = load_sparse_records(repository, package_name)
+        return [
+            str(r["vers"])
+            for r in records
+            if r.get("vers") and not r.get("yanked", False)
+        ]
+    url = f"{crate_api_prefix(repository)}/{quote(package_name, safe='')}"
+    body = http_get_text(url)
+    try:
+        data = json.loads(body)
+    except ValueError as exc:
+        raise RepoError("E13", "Ответ со списком версий не JSON") from exc
+    versions = data.get("versions") if isinstance(data, dict) else None
+    if not isinstance(versions, list):
+        raise RepoError("E13", "В ответе реестра отсутствует поле versions")
+    return [
+        str(v["num"])
+        for v in versions
+        if isinstance(v, dict) and v.get("num") and not v.get("yanked", False)
+    ]
+
+
+def select_best_version(versions, version_req):
+    """Выбирает наибольшую подходящую SemVer-версию из списка."""
+    candidates = []
+    for ver in versions:
+        parsed = parse_semver(ver)
+        if parsed and matches_version_req(ver, version_req):
+            candidates.append((parsed[:3], ver))
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+    fallback = [
+        (parse_semver(v)[:3], v)
+        for v in versions
+        if parse_semver(v) and not parse_semver(v)[3]
+    ]
+    if fallback:
+        fallback.sort(key=lambda item: item[0], reverse=True)
+        return fallback[0][1]
+    raise RepoError("E11", f"Нет подходящей версии для '{version_req}'")
+
+
+class CargoGraphSource:
+    """Кэширующий поставщик соседей графа для пакетов Cargo."""
+
+    def __init__(self, repository, root_package, root_version):
+        self.repository = repository
+        self.resolved = {root_package: root_version}
+        self.versions_cache = {}
+        self.deps_cache = {}
+
+    def resolve_req(self, package_name, version_req):
+        """Сопоставляет требование версии конкретному номеру релиза."""
+        if package_name in self.resolved:
+            return self.resolved[package_name]
+        if package_name not in self.versions_cache:
+            self.versions_cache[package_name] = fetch_available_versions(
+                self.repository, package_name
+            )
+        chosen = select_best_version(
+            self.versions_cache[package_name], version_req
+        )
+        self.resolved[package_name] = chosen
+        return chosen
+
+    def neighbors(self, package_name):
+        """Возвращает имена прямых зависимостей выбранной версии пакета."""
+        version = self.resolved[package_name]
+        key = (package_name, version)
+        if key not in self.deps_cache:
+            self.deps_cache[key] = fetch_direct_dependencies(
+                self.repository, package_name, version
+            )
+        deps = self.deps_cache[key]
+        result = []
+        for dep_name, version_req in deps:
+            self.resolve_req(dep_name, version_req)
+            result.append(dep_name)
+        return result

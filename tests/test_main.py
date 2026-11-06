@@ -11,12 +11,12 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from cargo_repo import (  # noqa: E402
+from cargo_repo import (
     RepoError,
     fetch_direct_dependencies,
     sparse_index_path,
 )
-from main import (  # noqa: E402
+from main import (
     ConfigError,
     format_direct_dependencies,
     main,

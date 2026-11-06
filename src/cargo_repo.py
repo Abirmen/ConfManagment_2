@@ -8,12 +8,17 @@ from urllib.request import Request, urlopen
 
 USER_AGENT = "cargo-dep-visualizer/0.2 (educational-project)"
 TIMEOUT_SECONDS = 15
+HTTP_NOT_FOUND = 404
+SHORT_NAME_ONE = 1
+SHORT_NAME_TWO = 2
+SHORT_NAME_THREE = 3
 
 
 class RepoError(RuntimeError):
     """Ошибка обращения к репозиторию Cargo или разбора метаданных."""
 
     def __init__(self, code, message):
+        """Сохраняет код и текст ошибки репозитория."""
         super().__init__(f"{code}: {message}")
         self.code = code
 
@@ -30,11 +35,11 @@ def sparse_index_path(package_name):
     """Вычисляет путь к файлу пакета в sparse-индексе Cargo."""
     lower = package_name.lower()
     length = len(lower)
-    if length == 1:
+    if length == SHORT_NAME_ONE:
         return f"1/{lower}"
-    if length == 2:
+    if length == SHORT_NAME_TWO:
         return f"2/{lower}"
-    if length == 3:
+    if length == SHORT_NAME_THREE:
         return f"3/{lower[0]}/{lower}"
     return f"{lower[:2]}/{lower[2:4]}/{lower}"
 
@@ -65,7 +70,7 @@ def extract_error_detail(exc):
 def raise_http_error(exc, url):
     """Преобразует HTTPError в исключение RepoError с кодом."""
     detail = extract_error_detail(exc)
-    if exc.code == 404:
+    if exc.code == HTTP_NOT_FOUND:
         msg = "Пакет или версия не найдены"
         if detail:
             msg = f"{msg}: {detail}"

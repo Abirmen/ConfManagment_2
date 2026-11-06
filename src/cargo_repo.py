@@ -14,12 +14,20 @@ SEMVER_RE = re.compile(
     r"(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
 )
 COMP_RE = re.compile(r"^(\^|~|>=|<=|>|<|=)?\s*([0-9]+(?:\.[0-9xX*]+)*)")
+HTTP_NOT_FOUND = 404
+SHORT_NAME_ONE = 1
+SHORT_NAME_TWO = 2
+SHORT_NAME_THREE = 3
+SINGLE_PART = 1
+MAJOR_MINOR_PARTS = 2
+VERSION_PARTS = 3
 
 
 class RepoError(RuntimeError):
     """Ошибка обращения к репозиторию Cargo или тестовому файлу."""
 
     def __init__(self, code, message):
+        """Сохраняет код и текст ошибки репозитория."""
         super().__init__(f"{code}: {message}")
         self.code = code
 
@@ -36,11 +44,11 @@ def sparse_index_path(package_name):
     """Вычисляет путь к файлу пакета в sparse-индексе Cargo."""
     lower = package_name.lower()
     length = len(lower)
-    if length == 1:
+    if length == SHORT_NAME_ONE:
         return f"1/{lower}"
-    if length == 2:
+    if length == SHORT_NAME_TWO:
         return f"2/{lower}"
-    if length == 3:
+    if length == SHORT_NAME_THREE:
         return f"3/{lower[0]}/{lower}"
     return f"{lower[:2]}/{lower[2:4]}/{lower}"
 
@@ -77,7 +85,7 @@ def extract_error_detail(exc):
 def raise_http_error(exc, url):
     """Преобразует HTTPError в исключение RepoError с кодом."""
     detail = extract_error_detail(exc)
-    if exc.code == 404:
+    if exc.code == HTTP_NOT_FOUND:
         msg = "Пакет или версия не найдены"
         if detail:
             msg = f"{msg}: {detail}"
@@ -126,14 +134,19 @@ def collect_dependencies(raw_items):
     return sorted(collected.items(), key=lambda pair: pair[0])
 
 
+def parse_json_body(body, message):
+    """Разбирает JSON-ответ и сообщает об ошибке формата."""
+    try:
+        return json.loads(body)
+    except ValueError as exc:
+        raise RepoError("E13", message) from exc
+
+
 def fetch_from_api(base_url, package_name, version):
     """Получает прямые зависимости через совместимый с crates.io API."""
     url = build_api_url(base_url, package_name, version)
     body = http_get_text(url)
-    try:
-        data = json.loads(body)
-    except ValueError as exc:
-        raise RepoError("E13", "Ответ сервера не является JSON") from exc
+    data = parse_json_body(body, "Ответ сервера не является JSON")
     if isinstance(data, dict) and "errors" in data:
         raise RepoError("E11", "Пакет или версия не найдены")
     if not isinstance(data, dict) or "dependencies" not in data:
@@ -190,25 +203,57 @@ def parse_semver(version_str):
 
 def caret_upper_bound(nums):
     """Вычисляет верхнюю границу диапазона для оператора '^' в Cargo."""
-    padded = (list(nums) + [0, 0, 0])[:3]
+    padded = (list(nums) + [0, 0, 0])[:VERSION_PARTS]
     major, minor, patch = padded[0], padded[1], padded[2]
-    if major > 0:
+    if major:
         return (major + 1, 0, 0)
-    if len(nums) == 1:
+    if len(nums) == SINGLE_PART:
         return (1, 0, 0)
-    if minor > 0:
+    if minor:
         return (0, minor + 1, 0)
-    if len(nums) == 2:
+    if len(nums) == MAJOR_MINOR_PARTS:
         return (0, 1, 0)
     return (0, 0, patch + 1)
 
 
 def tilde_upper_bound(nums):
     """Вычисляет верхнюю границу диапазона для оператора '~' в Cargo."""
-    padded = (list(nums) + [0, 0, 0])[:3]
-    if len(nums) == 1:
+    padded = (list(nums) + [0, 0, 0])[:VERSION_PARTS]
+    if len(nums) == SINGLE_PART:
         return (padded[0] + 1, 0, 0)
     return (padded[0], padded[1] + 1, 0)
+
+
+def parse_comparator(clean):
+    """Разбирает оператор и числовые части компаратора."""
+    match = COMP_RE.match(clean)
+    if not match:
+        return "", []
+    op = match.group(1) or "^"
+    raw_parts = match.group(2).split(".")
+    nums = [int(part) for part in raw_parts if part.isdigit()]
+    return op, nums
+
+
+def normalize_operator(op, num_parts):
+    """Уточняет оператор '=' для неполной SemVer-версии."""
+    if num_parts < VERSION_PARTS and op == "=":
+        if num_parts == MAJOR_MINOR_PARTS:
+            return "~"
+        return "^"
+    return op
+
+
+def compare_operator(ver_tuple, target, op):
+    """Сравнивает версии выбранным оператором."""
+    comparisons = {
+        ">=": ver_tuple >= target,
+        "<=": ver_tuple <= target,
+        ">": ver_tuple > target,
+        "<": ver_tuple < target,
+        "=": ver_tuple == target,
+    }
+    return comparisons.get(op, True)
 
 
 def check_comparator(ver_tuple, token):
@@ -216,30 +261,18 @@ def check_comparator(ver_tuple, token):
     clean = token.strip()
     if not clean or clean == "*":
         return True
-    match = COMP_RE.match(clean)
-    if not match:
-        return True
-    op = match.group(1) or "^"
-    raw_parts = match.group(2).split(".")
-    nums = [int(p) for p in raw_parts if p.isdigit()]
+    op, nums = parse_comparator(clean)
     if not nums:
         return True
-    padded = (nums + [0, 0, 0])[:3]
+    padded = (nums + [0, 0, 0])[:VERSION_PARTS]
     target = (padded[0], padded[1], padded[2])
-    if len(nums) < 3 and op == "=":
-        op = "~" if len(nums) == 2 else "^"
+    op = normalize_operator(op, len(nums))
     if op == "^":
-        return target <= ver_tuple < caret_upper_bound(padded[: len(nums)])
+        upper = caret_upper_bound(padded[: len(nums)])
+        return target <= ver_tuple < upper
     if op == "~":
         return target <= ver_tuple < tilde_upper_bound(nums)
-    ops = {
-        ">=": ver_tuple >= target,
-        "<=": ver_tuple <= target,
-        ">": ver_tuple > target,
-        "<": ver_tuple < target,
-        "=": ver_tuple == target,
-    }
-    return ops.get(op, True)
+    return compare_operator(ver_tuple, target, op)
 
 
 def matches_version_req(version_str, req_str):
@@ -252,29 +285,39 @@ def matches_version_req(version_str, req_str):
     return all(check_comparator(ver_tuple, part) for part in parts)
 
 
-def fetch_available_versions(repository, package_name):
-    """Возвращает список доступных не-отозванных версий пакета."""
-    if is_sparse_repository(repository):
-        records = load_sparse_records(repository, package_name)
-        return [
-            str(r["vers"])
-            for r in records
-            if r.get("vers") and not r.get("yanked", False)
-        ]
-    url = f"{crate_api_prefix(repository)}/{quote(package_name, safe='')}"
-    body = http_get_text(url)
-    try:
-        data = json.loads(body)
-    except ValueError as exc:
-        raise RepoError("E13", "Ответ со списком версий не JSON") from exc
+def versions_from_sparse(repository, package_name):
+    """Возвращает версии пакета из sparse-индекса."""
+    records = load_sparse_records(repository, package_name)
+    return [
+        str(record["vers"])
+        for record in records
+        if record.get("vers") and not record.get("yanked", False)
+    ]
+
+
+def versions_from_api(repository, package_name):
+    """Возвращает версии пакета из HTTP API реестра."""
+    base = crate_api_prefix(repository)
+    quoted_name = quote(package_name, safe="")
+    body = http_get_text(f"{base}/{quoted_name}")
+    data = parse_json_body(body, "Ответ со списком версий не JSON")
     versions = data.get("versions") if isinstance(data, dict) else None
     if not isinstance(versions, list):
         raise RepoError("E13", "В ответе реестра отсутствует поле versions")
     return [
-        str(v["num"])
-        for v in versions
-        if isinstance(v, dict) and v.get("num") and not v.get("yanked", False)
+        str(item["num"])
+        for item in versions
+        if isinstance(item, dict)
+        and item.get("num")
+        and not item.get("yanked", False)
     ]
+
+
+def fetch_available_versions(repository, package_name):
+    """Возвращает список доступных не-отозванных версий пакета."""
+    if is_sparse_repository(repository):
+        return versions_from_sparse(repository, package_name)
+    return versions_from_api(repository, package_name)
 
 
 def select_best_version(versions, version_req):
@@ -302,6 +345,7 @@ class CargoGraphSource:
     """Кэширующий поставщик соседей графа для пакетов Cargo."""
 
     def __init__(self, repository, root_package, root_version):
+        """Сохраняет репозиторий, корневой пакет и кэши версий."""
         self.repository = repository
         self.resolved = {root_package: root_version}
         self.versions_cache = {}

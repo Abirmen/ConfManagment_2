@@ -1,3 +1,5 @@
+"""Модульные тесты чтения и проверки XML-конфигурации."""
+
 import sys
 import tempfile
 import unittest
@@ -7,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from main import ConfigError, main, read_config, validate_config  # noqa: E402
+from main import ConfigError, main, read_config, validate_config
 
 
 ROOT = Path(__file__).resolve().parents[1]

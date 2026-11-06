@@ -7,8 +7,15 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 
-USER_AGENT = "cargo-dep-visualizer/0.3 (educational-project)"
+USER_AGENT = "cargo-dep-visualizer/0.5 (educational-project)"
 TIMEOUT_SECONDS = 15
+HTTP_NOT_FOUND = 404
+LEN_ONE = 1
+LEN_TWO = 2
+LEN_THREE = 3
+SINGLE_PART = 1
+TWO_PARTS = 2
+FULL_PARTS = 3
 SEMVER_RE = re.compile(
     r"^([0-9]+)\.([0-9]+)\.([0-9]+)"
     r"(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
@@ -20,6 +27,7 @@ class RepoError(RuntimeError):
     """Ошибка обращения к репозиторию Cargo или тестовому файлу."""
 
     def __init__(self, code, message):
+        """Сохраняет код и описание ошибки репозитория."""
         super().__init__(f"{code}: {message}")
         self.code = code
 
@@ -36,11 +44,11 @@ def sparse_index_path(package_name):
     """Вычисляет путь к файлу пакета в sparse-индексе Cargo."""
     lower = package_name.lower()
     length = len(lower)
-    if length == 1:
+    if length == LEN_ONE:
         return f"1/{lower}"
-    if length == 2:
+    if length == LEN_TWO:
         return f"2/{lower}"
-    if length == 3:
+    if length == LEN_THREE:
         return f"3/{lower[0]}/{lower}"
     return f"{lower[:2]}/{lower[2:4]}/{lower}"
 
@@ -77,7 +85,7 @@ def extract_error_detail(exc):
 def raise_http_error(exc, url):
     """Преобразует HTTPError в исключение RepoError с кодом."""
     detail = extract_error_detail(exc)
-    if exc.code == 404:
+    if exc.code == HTTP_NOT_FOUND:
         msg = "Пакет или версия не найдены"
         if detail:
             msg = f"{msg}: {detail}"
@@ -100,6 +108,15 @@ def http_get_text(url):
         raise RepoError("E12", f"Ошибка сети: {reason}") from exc
 
 
+def resolve_dep_name(item):
+    """Извлекает непустое имя пакета из словаря зависимости."""
+    for field in ("crate_id", "package", "name"):
+        val = item.get(field)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    raise RepoError("E13", "В метаданных не указано имя зависимости")
+
+
 def extract_dep_entry(item):
     """Извлекает имя и требование к версии для обычной зависимости."""
     if not isinstance(item, dict):
@@ -107,11 +124,9 @@ def extract_dep_entry(item):
     kind = item.get("kind") or "normal"
     if kind != "normal" or bool(item.get("optional", False)):
         return None
-    name = item.get("crate_id") or item.get("package") or item.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise RepoError("E13", "В метаданных не указано имя зависимости")
+    name = resolve_dep_name(item)
     req = str(item.get("req") or "*").strip()
-    return name.strip(), req
+    return name, req
 
 
 def collect_dependencies(raw_items):
@@ -190,46 +205,38 @@ def parse_semver(version_str):
 
 def caret_upper_bound(nums):
     """Вычисляет верхнюю границу диапазона для оператора '^' в Cargo."""
-    padded = (list(nums) + [0, 0, 0])[:3]
+    padded = (list(nums) + [0, 0, 0])[:FULL_PARTS]
     major, minor, patch = padded[0], padded[1], padded[2]
-    if major > 0:
+    if major:
         return (major + 1, 0, 0)
-    if len(nums) == 1:
+    if len(nums) == SINGLE_PART:
         return (1, 0, 0)
-    if minor > 0:
+    if minor:
         return (0, minor + 1, 0)
-    if len(nums) == 2:
+    if len(nums) == TWO_PARTS:
         return (0, 1, 0)
     return (0, 0, patch + 1)
 
 
 def tilde_upper_bound(nums):
     """Вычисляет верхнюю границу диапазона для оператора '~' в Cargo."""
-    padded = (list(nums) + [0, 0, 0])[:3]
-    if len(nums) == 1:
+    padded = (list(nums) + [0, 0, 0])[:FULL_PARTS]
+    if len(nums) == SINGLE_PART:
         return (padded[0] + 1, 0, 0)
     return (padded[0], padded[1] + 1, 0)
 
 
-def check_comparator(ver_tuple, token):
-    """Проверяет соответствие версии одному SemVer-компаратору."""
-    clean = token.strip()
-    if not clean or clean == "*":
-        return True
-    match = COMP_RE.match(clean)
-    if not match:
-        return True
-    op = match.group(1) or "^"
-    raw_parts = match.group(2).split(".")
-    nums = [int(p) for p in raw_parts if p.isdigit()]
-    if not nums:
-        return True
-    padded = (nums + [0, 0, 0])[:3]
-    target = (padded[0], padded[1], padded[2])
-    if len(nums) < 3 and op == "=":
-        op = "~" if len(nums) == 2 else "^"
+def normalize_op(op, parts_count):
+    """Уточняет оператор '=' для сокращённой записи версии."""
+    if op == "=" and parts_count < FULL_PARTS:
+        return "~" if parts_count == TWO_PARTS else "^"
+    return op
+
+
+def apply_comparator_op(op, ver_tuple, target, nums):
+    """Применяет оператор сравнения SemVer к кортежу версии."""
     if op == "^":
-        return target <= ver_tuple < caret_upper_bound(padded[: len(nums)])
+        return target <= ver_tuple < caret_upper_bound(nums)
     if op == "~":
         return target <= ver_tuple < tilde_upper_bound(nums)
     ops = {
@@ -242,14 +249,44 @@ def check_comparator(ver_tuple, token):
     return ops.get(op, True)
 
 
+def check_comparator(ver_tuple, token):
+    """Проверяет соответствие версии одному SemVer-компаратору."""
+    clean = token.strip()
+    if not clean or clean == "*":
+        return True
+    match = COMP_RE.match(clean)
+    if not match:
+        return True
+    raw_op = match.group(1) if match.group(1) else "^"
+    nums = [int(p) for p in match.group(2).split(".") if p.isdigit()]
+    if not nums:
+        return True
+    padded = (nums + [0, 0, 0])[:FULL_PARTS]
+    target = (padded[0], padded[1], padded[2])
+    op = normalize_op(raw_op, len(nums))
+    return apply_comparator_op(op, ver_tuple, target, nums)
+
+
 def matches_version_req(version_str, req_str):
     """Проверяет, удовлетворяет ли стабильная версия строке Cargo req."""
     parsed = parse_semver(version_str)
     if parsed is None or parsed[3]:
         return False
-    ver_tuple = parsed[:3]
+    ver_tuple = parsed[:FULL_PARTS]
     parts = [part.strip() for part in req_str.split(",") if part.strip()]
     return all(check_comparator(ver_tuple, part) for part in parts)
+
+
+def extract_api_version_nums(versions):
+    """Отбирает номера активных версий из списка API crates.io."""
+    result = []
+    for item in versions:
+        if not isinstance(item, dict) or item.get("yanked", False):
+            continue
+        num = item.get("num")
+        if num:
+            result.append(str(num))
+    return result
 
 
 def fetch_available_versions(repository, package_name):
@@ -270,31 +307,29 @@ def fetch_available_versions(repository, package_name):
     versions = data.get("versions") if isinstance(data, dict) else None
     if not isinstance(versions, list):
         raise RepoError("E13", "В ответе реестра отсутствует поле versions")
-    return [
-        str(v["num"])
-        for v in versions
-        if isinstance(v, dict) and v.get("num") and not v.get("yanked", False)
-    ]
+    return extract_api_version_nums(versions)
+
+
+def collect_stable_versions(versions):
+    """Возвращает список стабильных версий в виде пар (кортеж, строка)."""
+    stable = []
+    for ver in versions:
+        parsed = parse_semver(ver)
+        if parsed and not parsed[3]:
+            stable.append((parsed[:FULL_PARTS], ver))
+    return stable
 
 
 def select_best_version(versions, version_req):
     """Выбирает наибольшую подходящую SemVer-версию из списка."""
-    candidates = []
-    for ver in versions:
-        parsed = parse_semver(ver)
-        if parsed and matches_version_req(ver, version_req):
-            candidates.append((parsed[:3], ver))
-    if candidates:
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates[0][1]
-    fallback = [
-        (parse_semver(v)[:3], v)
-        for v in versions
-        if parse_semver(v) and not parse_semver(v)[3]
+    stable = collect_stable_versions(versions)
+    candidates = [
+        item for item in stable if matches_version_req(item[1], version_req)
     ]
-    if fallback:
-        fallback.sort(key=lambda item: item[0], reverse=True)
-        return fallback[0][1]
+    pool = candidates if candidates else stable
+    if pool:
+        pool.sort(key=lambda item: item[0], reverse=True)
+        return pool[0][1]
     raise RepoError("E11", f"Нет подходящей версии для '{version_req}'")
 
 
@@ -302,6 +337,7 @@ class CargoGraphSource:
     """Кэширующий поставщик соседей графа для пакетов Cargo."""
 
     def __init__(self, repository, root_package, root_version):
+        """Инициализирует кэши версий и прямых зависимостей."""
         self.repository = repository
         self.resolved = {root_package: root_version}
         self.versions_cache = {}

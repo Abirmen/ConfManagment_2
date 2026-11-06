@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+    <package_name>http</package_name>
+    <repository>https://crates.io</repository>
+    <test_mode>false</test_mode>
+    <package_version>1.1.0</package_version>
+    <output_file>http-graph.svg</output_file>
+    <ascii_tree>true</ascii_tree>
+    <filter_substring></filter_substring>
+</config>

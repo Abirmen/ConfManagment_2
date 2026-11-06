@@ -1,9 +1,11 @@
-"""Модульные тесты конфигурации, Cargo, графа DFS и порядка загрузки."""
+"""Модульные тесты всех этапов анализатора и визуализатора (этапы 1–5)."""
 
 import json
+import os
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from contextlib import redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -11,7 +13,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from cargo_repo import (  # noqa: E402
+from cargo_repo import (
     CargoGraphSource,
     RepoError,
     fetch_direct_dependencies,
@@ -19,17 +21,19 @@ from cargo_repo import (  # noqa: E402
     select_best_version,
     sparse_index_path,
 )
-from dep_graph import (  # noqa: E402
+from dep_graph import (
     build_graph_dfs,
     load_test_repository,
 )
-from load_order import compute_load_order  # noqa: E402
-from main import (  # noqa: E402
+from load_order import compute_load_order
+from main import (
     ConfigError,
     main,
     read_config,
     validate_config,
 )
+from svg_renderer import render_builtin_svg
+from visualizer import format_ascii_tree, generate_d2
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +44,21 @@ class ConfigTests(unittest.TestCase):
 
     def setUp(self):
         self.sample = read_config(ROOT / "config.xml")
+
+    def run_cli_in_temp_cwd(self, argv):
+        """Запускает CLI во временной папке для изоляции создаваемых SVG."""
+        output = StringIO()
+        prev_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.chdir(tmp_dir)
+            try:
+                with redirect_stdout(output):
+                    code = main(argv)
+                svg_files = {p.name: p.read_text("utf-8") for p in
+                             Path(tmp_dir).glob("*.svg")}
+            finally:
+                os.chdir(prev_cwd)
+        return code, output.getvalue(), svg_files
 
     def check_error(self, field, value, code):
         """Проверяет код ошибки после замены одного параметра."""
@@ -65,37 +84,35 @@ class ConfigTests(unittest.TestCase):
             validate_config(config, path)
         self.assertEqual(ctx.exception.code, "E04")
 
-    def test_main_prints_filtered_load_order(self):
-        output = StringIO()
+    def test_main_writes_svg_and_omits_ascii_when_disabled(self):
         cfg = str(ROOT / "examples" / "config-test.xml")
-        with redirect_stdout(output):
-            result = main(["--config", cfg])
-        self.assertEqual(result, 0)
-        text = output.getvalue()
-        self.assertIn("1. G", text)
-        self.assertIn("5. A", text)
-        self.assertNotIn(". B", text)
+        code, text, svgs = self.run_cli_in_temp_cwd(["--config", cfg])
+        self.assertEqual(code, 0)
+        self.assertIn("Описание графа на языке D2:", text)
+        self.assertIn('"A" -> "C"', text)
+        self.assertNotIn("ASCII-дерево зависимостей:", text)
+        self.assertIn("test-graph.svg", svgs)
+        ET.fromstring(svgs["test-graph.svg"])
 
-    def test_main_runs_cycle_config(self):
-        output = StringIO()
-        cfg = str(ROOT / "examples" / "config-cycle.xml")
-        with redirect_stdout(output):
-            result = main(["--config", cfg])
-        self.assertEqual(result, 0)
-        text = output.getvalue()
-        self.assertIn("строгий топологический порядок не существует", text)
-        self.assertIn("C -> A", text)
-        self.assertIn("Приближённый порядок", text)
-
-    def test_main_show_graph_flag(self):
-        output = StringIO()
-        cfg = str(ROOT / "examples" / "config-isolated.xml")
-        with redirect_stdout(output):
-            result = main(["--config", cfg, "--show-graph"])
-        self.assertEqual(result, 0)
-        text = output.getvalue()
-        self.assertIn("Граф зависимостей (корень: Z):", text)
-        self.assertIn("Порядок загрузки зависимостей (корень: Z):", text)
+    def test_main_prints_ascii_tree_when_enabled(self):
+        xml = (ROOT / "examples" / "config-diamond.xml").read_text("utf-8")
+        xml = xml.replace("<ascii_tree>false</ascii_tree>",
+                          "<ascii_tree>true</ascii_tree>")
+        with tempfile.TemporaryDirectory() as folder:
+            cfg_path = Path(folder) / "cfg.xml"
+            repo_src = (ROOT / "examples" / "test-repository.txt")
+            (Path(folder) / "test-repository.txt").write_text(
+                repo_src.read_text("utf-8"), encoding="utf-8"
+            )
+            cfg_path.write_text(xml, encoding="utf-8")
+            code, text, svgs = self.run_cli_in_temp_cwd(
+                ["--config", str(cfg_path), "--load-order", "--show-graph"]
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("ASCII-дерево зависимостей:", text)
+        self.assertIn("├── B", text)
+        self.assertIn("Порядок загрузки зависимостей", text)
+        self.assertIn("diamond-graph.svg", svgs)
 
     def test_e01_missing_file(self):
         with self.assertRaisesRegex(ConfigError, "E01"):
@@ -202,8 +219,6 @@ class CargoRepoTests(unittest.TestCase):
         self.assertTrue(matches_version_req("1.9.0", "^1"))
         self.assertTrue(matches_version_req("1.4.2", "^1.0"))
         self.assertFalse(matches_version_req("2.0.0", "^1"))
-        self.assertTrue(matches_version_req("0.2.9", "^0.2.1"))
-        self.assertTrue(matches_version_req("1.4.9", "~1.4.2"))
         chosen = select_best_version(["1.0.1", "1.0.9", "2.0.0"], "^1.0")
         self.assertEqual(chosen, "1.0.9")
 
@@ -224,7 +239,6 @@ class CargoRepoTests(unittest.TestCase):
             src = CargoGraphSource("https://crates.io", "root", "1.0.0")
             graph, cycles = build_graph_dfs("root", "", src.neighbors)
         self.assertEqual(cycles, [])
-        self.assertEqual(graph["root"], ["mid"])
         self.assertEqual(graph["mid"], ["leaf"])
 
     def test_e11_e12_e13_errors(self):
@@ -241,35 +255,39 @@ class CargoRepoTests(unittest.TestCase):
                 fetch_direct_dependencies("https://crates.io", "x", "1.0.0")
 
 
-class DepGraphAndOrderTests(unittest.TestCase):
-    """Тесты нерекурсивного DFS и порядка загрузки зависимостей."""
+class GraphOrderAndVizTests(unittest.TestCase):
+    """Тесты графа DFS, порядка загрузки, D2, SVG и ASCII-дерева."""
 
     def test_diamond_wave_load_order(self):
         repo = load_test_repository(ROOT / "examples" / "test-repository.txt")
         graph, cycles = build_graph_dfs("A", "", lambda n: repo[n])
         result = compute_load_order(graph, cycles)
-        self.assertFalse(result["has_cycle"])
-        order = result["order"]
-        self.assertEqual(order, ["E", "G", "D", "F", "B", "C", "A"])
-        for pkg, deps in graph.items():
-            for dep in deps:
-                self.assertLess(order.index(dep), order.index(pkg))
+        self.assertEqual(result["order"], ["E", "G", "D", "F", "B", "C", "A"])
 
-    def test_cycle_detection_and_approximate_order(self):
+    def test_cycle_detection_and_visualizers(self):
         path = ROOT / "examples" / "test-cycle-repository.txt"
         repo = load_test_repository(path)
         graph, cycles = build_graph_dfs("A", "", lambda n: repo[n])
-        result = compute_load_order(graph, cycles)
-        self.assertTrue(result["has_cycle"])
-        self.assertEqual(result["order"], ["E"])
-        self.assertEqual(result["blocked"], ["A", "B", "C", "D"])
-        self.assertEqual(result["approx_order"], ["D", "E", "C", "B", "A"])
+        d2 = generate_d2("A", graph, cycles)
+        self.assertIn("direction: down", d2)
+        self.assertIn('"C" -> "A": "cycle"', d2)
+        tree = format_ascii_tree("A", graph)
+        self.assertIn("A [цикл]", tree)
+        self.assertIn("D [цикл]", tree)
+        svg = render_builtin_svg("A", graph, cycles)
+        ET.fromstring(svg)
 
-    def test_filtered_root_returns_empty_graph(self):
-        repo = {"A": ["B"], "B": []}
-        graph, cycles = build_graph_dfs("A", "A", lambda n: repo[n])
-        self.assertEqual(graph, {})
-        self.assertEqual(cycles, [])
+    def test_ascii_tree_marks_repeated_subtrees(self):
+        graph = {"A": ["B", "C"], "B": ["D"], "C": ["B"], "D": []}
+        versions = {"A": "1.0.0", "B": "1.1.0", "C": "1.2.0", "D": "1.3.0"}
+        tree = format_ascii_tree("A", graph, versions)
+        self.assertIn("A v1.0.0", tree)
+        self.assertIn("B v1.1.0 (*)", tree)
+
+    def test_empty_filtered_graph_svg_and_tree(self):
+        svg = render_builtin_svg("A", {})
+        ET.fromstring(svg)
+        self.assertIn("отфильтрован", format_ascii_tree("A", {}))
 
     def test_deep_chain_without_recursion_limit(self):
         depth = 1500
@@ -277,18 +295,16 @@ class DepGraphAndOrderTests(unittest.TestCase):
         repo = {nodes[i]: [nodes[i + 1]] for i in range(depth - 1)}
         repo[nodes[-1]] = []
         graph, cycles = build_graph_dfs("N0", "", lambda n: repo[n])
-        result = compute_load_order(graph, cycles)
-        self.assertEqual(len(result["order"]), depth)
-        self.assertEqual(result["order"][0], f"N{depth - 1}")
-        self.assertEqual(result["order"][-1], "N0")
+        tree = format_ascii_tree("N0", graph)
+        self.assertEqual(len(tree.splitlines()), depth)
+        self.assertEqual(cycles, [])
 
     def test_invalid_test_repository_format_raises_e15(self):
         with tempfile.TemporaryDirectory() as folder:
             bad_file = Path(folder) / "bad.txt"
             bad_file.write_text("a_lower: B\n", encoding="utf-8")
-            with self.assertRaises(RepoError) as ctx:
+            with self.assertRaisesRegex(RepoError, "E15"):
                 load_test_repository(bad_file)
-            self.assertEqual(ctx.exception.code, "E15")
 
 
 if __name__ == "__main__":

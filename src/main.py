@@ -1,4 +1,4 @@
-"""Точка входа CLI, проверка XML и порядок загрузки (этап 4)."""
+"""Точка входа CLI, проверка XML и визуализация графа (этап 5)."""
 
 import argparse
 import re
@@ -15,6 +15,7 @@ from dep_graph import (
     load_test_repository,
 )
 from load_order import format_load_order_report
+from visualizer import format_ascii_tree, generate_d2, save_svg_graph
 
 
 FIELDS = (
@@ -32,36 +33,49 @@ VERSION_RE = re.compile(
     r"^[0-9]+\.[0-9]+\.[0-9]+"
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
+FORBIDDEN_FILTER_CHARS = ("\x00", "\n", "\r")
+EXIT_OK = 0
+EXIT_ERROR = 1
 
 
 class ConfigError(ValueError):
     """Ошибка пользовательской конфигурации с кодом."""
 
     def __init__(self, code, message):
+        """Сохраняет код и текст ошибки конфигурации."""
         super().__init__(f"{code}: {message}")
         self.code = code
 
 
-def read_config(path):
-    """Читает XML и проверяет структуру полей."""
+def parse_xml_root(path):
+    """Открывает XML-файл и проверяет корневой тег <config>."""
     try:
         root = ET.parse(path).getroot()
     except (OSError, UnicodeError) as exc:
         raise ConfigError("E01", f"Не удаётся прочитать файл: {exc}") from exc
     except ET.ParseError as exc:
         raise ConfigError("E02", f"Неверный XML: {exc}") from exc
-
     if root.tag != "config" or root.attrib:
         raise ConfigError("E03", "Корень должен быть <config> без атрибутов")
+    return root
 
+
+def validate_xml_element(element, seen):
+    """Проверяет отдельный дочерний элемент XML на допустимость."""
+    if element.tag not in FIELDS or element.attrib or list(element):
+        raise ConfigError("E03", f"Неожиданный элемент: {element.tag}")
+    if element.tag in seen:
+        raise ConfigError("E10", f"Повтор параметра: {element.tag}")
+
+
+def read_config(path):
+    """Читает XML и проверяет наличие всех обязательных полей."""
+    root = parse_xml_root(path)
     result = {}
     for element in root:
-        if element.tag not in FIELDS or element.attrib or len(element):
-            raise ConfigError("E03", f"Неожиданный элемент: {element.tag}")
-        if element.tag in result:
-            raise ConfigError("E10", f"Повтор параметра: {element.tag}")
-        result[element.tag] = (element.text or "").strip()
-
+        validate_xml_element(element, result)
+        text = element.text if element.text is not None else ""
+        result[element.tag] = text.strip()
     missing = [field for field in FIELDS if field not in result]
     if missing:
         raise ConfigError("E03", "Отсутствуют поля: " + ", ".join(missing))
@@ -108,25 +122,26 @@ def validate_package_name(name, test_mode):
         raise ConfigError("E04", msg)
 
 
+def validate_output_file(output):
+    """Проверяет корректность имени выходного SVG-файла."""
+    if not output or Path(output).name != output:
+        raise ConfigError("E08", "Укажите имя файла, например graph.svg")
+    if output in {".", ".."} or not output.endswith(".svg"):
+        raise ConfigError("E08", "Укажите имя файла, например graph.svg")
+
+
 def validate_config(config, config_path):
     """Проверяет значения всех семи полей."""
     test_mode = parse_boolean(config, "test_mode")
     ascii_tree = parse_boolean(config, "ascii_tree")
     validate_package_name(config["package_name"], test_mode)
     validate_repository(config["repository"], test_mode, config_path)
-
     if not VERSION_RE.fullmatch(config["package_version"]):
         raise ConfigError("E07", "Версия должна иметь вид 1.2.3")
-
-    output = config["output_file"]
-    if (not output or Path(output).name != output
-            or output in {".", ".."} or not output.endswith(".svg")):
-        raise ConfigError("E08", "Укажите имя файла, например graph.svg")
-
+    validate_output_file(config["output_file"])
     substring = config["filter_substring"]
-    if "\x00" in substring or "\n" in substring or "\r" in substring:
+    if any(ch in substring for ch in FORBIDDEN_FILTER_CHARS):
         raise ConfigError("E09", "Недопустимые символы в фильтре")
-
     config["test_mode"] = test_mode
     config["ascii_tree"] = ascii_tree
     return config
@@ -159,21 +174,31 @@ def build_from_cargo_repo(config):
     return graph, cycles, source.resolved
 
 
-def run_stage_four(config, config_path, show_graph=False):
-    """Вычисляет и выводит порядок загрузки зависимостей пакета."""
+def run_stage_five(config, config_path, args):
+    """Выполняет генерацию D2, сохранение SVG и опциональный вывод дерева."""
     if config["test_mode"]:
         graph, cycles, versions = build_from_test_repo(config, config_path)
     else:
         graph, cycles, versions = build_from_cargo_repo(config)
     root = config["package_name"]
-    if show_graph:
+    if args.show_graph:
         print(format_graph_report(root, graph, cycles))
-    print(format_load_order_report(root, graph, cycles, versions))
+    if args.load_order:
+        print(format_load_order_report(root, graph, cycles, versions))
+    d2_text = generate_d2(root, graph, cycles, versions)
+    out_path = Path(config["output_file"]).resolve()
+    save_svg_graph(d2_text, out_path, root, graph, cycles, versions)
+    print("Описание графа на языке D2:")
+    print(d2_text.rstrip())
+    print(f"SVG-изображение сохранено: {out_path.name}")
+    if config["ascii_tree"]:
+        print("ASCII-дерево зависимостей:")
+        print(format_ascii_tree(root, graph, versions))
 
 
 def build_arg_parser():
-    """Создаёт парсер аргументов командной строки для этапа 4."""
-    parser = argparse.ArgumentParser(description="Вариант 2 — этап 4")
+    """Создаёт парсер аргументов командной строки для этапа 5."""
+    parser = argparse.ArgumentParser(description="Вариант 2 — этап 5")
     parser.add_argument(
         "--config", default="config.xml", help="Путь к XML-конфигурации"
     )
@@ -182,20 +207,25 @@ def build_arg_parser():
         action="store_true",
         help="Дополнительно вывести список смежности графа",
     )
+    parser.add_argument(
+        "--load-order",
+        action="store_true",
+        help="Дополнительно вывести порядок загрузки зависимостей",
+    )
     return parser
 
 
 def main(argv=None):
-    """Точка входа CLI для вывода порядка загрузки зависимостей."""
+    """Точка входа CLI для визуализации графа зависимостей."""
     args = build_arg_parser().parse_args(argv)
     try:
         path = Path(args.config).expanduser().resolve()
         config = validate_config(read_config(path), path)
-        run_stage_four(config, path, show_graph=args.show_graph)
+        run_stage_five(config, path, args)
     except (ConfigError, RepoError) as exc:
         print(f"Ошибка {exc}", file=sys.stderr)
-        return 1
-    return 0
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 if __name__ == "__main__":

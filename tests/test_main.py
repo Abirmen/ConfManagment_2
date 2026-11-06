@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as element_tree
 from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -116,7 +116,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("A v1.0.0", text)
         self.assertIn("v1.2.0", text)
         self.assertIn("v1.0.0", svgs["test-graph.svg"])
-        ET.fromstring(svgs["test-graph.svg"])
+        element_tree.fromstring(svgs["test-graph.svg"])
 
     def test_ascii_tree_can_be_disabled(self):
         code, text, _, _ = self.run_cli_in_temp_cwd(
@@ -138,7 +138,7 @@ class CliTests(unittest.TestCase):
         svg = svgs["http-graph.svg"]
         self.assertIn("v1.1.0", svg)
         self.assertIn("v1.12.1", svg)
-        ET.fromstring(svg)
+        element_tree.fromstring(svg)
 
     def test_invalid_cli_arguments_return_error(self):
         code, _, errors, _ = self.run_cli_in_temp_cwd(
@@ -198,7 +198,8 @@ class CargoRepoTests(unittest.TestCase):
                 {"crate_id": "cc", "req": "^1.0", "kind": "build"},
             ]
         }
-        with patch("cargo_repo.http_get_text", return_value=json.dumps(payload)):
+        body = json.dumps(payload)
+        with patch("cargo_repo.http_get_text", return_value=body):
             deps = fetch_direct_dependencies(
                 "https://crates.io", "serde_derive", "1.0.210"
             )
@@ -301,7 +302,7 @@ class GraphOrderAndVizTests(unittest.TestCase):
         self.assertIn("A [цикл]", tree)
         self.assertIn("D [цикл]", tree)
         svg = render_builtin_svg("A", graph, cycles)
-        ET.fromstring(svg)
+        element_tree.fromstring(svg)
 
     def test_versions_are_rendered_in_d2_svg_and_tree(self):
         versions = {"A": "1.0.0", "B": "1.2.0"}
@@ -322,7 +323,7 @@ class GraphOrderAndVizTests(unittest.TestCase):
 
     def test_empty_filtered_graph_svg_and_tree(self):
         svg = render_builtin_svg("A", {})
-        ET.fromstring(svg)
+        element_tree.fromstring(svg)
         self.assertIn("отфильтрован", format_ascii_tree("A", {}))
 
     def test_deep_chain_without_recursion_limit(self):

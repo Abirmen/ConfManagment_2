@@ -1,4 +1,7 @@
-"""Точка входа CLI: параметры задаются аргументами, файл конфигурации не нужен."""
+"""Точка входа CLI: параметры задаются аргументами.
+
+Файл конфигурации не требуется.
+"""
 
 import argparse
 import re
@@ -98,11 +101,8 @@ def validate_filter(substring):
         raise ConfigError("E09", "Недопустимые символы в фильтре")
 
 
-def build_arg_parser():
-    """Создаёт парсер аргументов командной строки."""
-    parser = argparse.ArgumentParser(
-        description="Визуализатор графа зависимостей Cargo (вариант 2)"
-    )
+def add_source_arguments(parser):
+    """Добавляет аргументы пакета, репозитория и версии."""
     parser.add_argument(
         "-p", "--package",
         default=None,
@@ -125,6 +125,10 @@ def build_arg_parser():
         help="Версия пакета (по умолчанию: последняя стабильная; "
              "в тестовом режиме: 1.0.0)",
     )
+
+
+def add_output_arguments(parser):
+    """Добавляет аргументы выходного файла и ASCII-дерева."""
     parser.add_argument(
         "-o", "--output",
         default=None,
@@ -136,6 +140,10 @@ def build_arg_parser():
         default=True,
         help="Выводить ASCII-дерево зависимостей (включено по умолчанию)",
     )
+
+
+def add_report_arguments(parser):
+    """Добавляет аргументы фильтра и дополнительных отчётов."""
     parser.add_argument(
         "--filter",
         dest="filter_substring",
@@ -152,6 +160,16 @@ def build_arg_parser():
         action="store_true",
         help="Дополнительно вывести порядок загрузки зависимостей",
     )
+
+
+def build_arg_parser():
+    """Создаёт парсер аргументов командной строки."""
+    parser = argparse.ArgumentParser(
+        description="Визуализатор графа зависимостей Cargo (вариант 2)"
+    )
+    add_source_arguments(parser)
+    add_output_arguments(parser)
+    add_report_arguments(parser)
     return parser
 
 

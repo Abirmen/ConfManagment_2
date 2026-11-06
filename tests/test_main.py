@@ -11,7 +11,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from cargo_repo import (  # noqa: E402
+from cargo_repo import (
     CargoGraphSource,
     RepoError,
     fetch_direct_dependencies,
@@ -19,12 +19,12 @@ from cargo_repo import (  # noqa: E402
     select_best_version,
     sparse_index_path,
 )
-from dep_graph import (  # noqa: E402
+from dep_graph import (
     build_graph_dfs,
     load_test_repository,
 )
-from load_order import compute_load_order  # noqa: E402
-from main import (  # noqa: E402
+from load_order import compute_load_order
+from main import (
     ConfigError,
     main,
     read_config,
@@ -173,7 +173,8 @@ class CargoRepoTests(unittest.TestCase):
                 {"crate_id": "cc", "req": "^1.0", "kind": "build"},
             ]
         }
-        with patch("cargo_repo.http_get_text", return_value=json.dumps(payload)):
+        body = json.dumps(payload)
+        with patch("cargo_repo.http_get_text", return_value=body):
             deps = fetch_direct_dependencies(
                 "https://crates.io", "serde_derive", "1.0.210"
             )

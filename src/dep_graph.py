@@ -6,6 +6,9 @@ from cargo_repo import RepoError
 
 
 TEST_PKG_RE = re.compile(r"^[A-Z]+$")
+WHITE = 0
+GRAY = 1
+BLACK = 2
 
 
 def parse_test_line(raw_line, line_no):
@@ -56,13 +59,13 @@ def is_filtered(name, substring):
 
 def push_neighbor(state, stack, cycles, node, dep, get_neighbors):
     """Обрабатывает переход по ребру (node -> dep) в итеративном DFS."""
-    dep_state = state.get(dep, 0)
-    if dep_state == 1:
+    dep_state = state.get(dep, WHITE)
+    if dep_state == GRAY:
         edge = (node, dep)
         if edge not in cycles:
             cycles.append(edge)
-    elif dep_state == 0:
-        state[dep] = 1
+    elif dep_state == WHITE:
+        state[dep] = GRAY
         stack.append((dep, iter(get_neighbors(dep))))
 
 
@@ -72,7 +75,7 @@ def build_graph_dfs(root, filter_substring, get_neighbors):
         return {}, []
     graph = {}
     cycles = []
-    state = {root: 1}
+    state = {root: GRAY}
     stack = [(root, iter(get_neighbors(root)))]
     while stack:
         node, iterator = stack[-1]
@@ -80,7 +83,7 @@ def build_graph_dfs(root, filter_substring, get_neighbors):
         try:
             dep = next(iterator)
         except StopIteration:
-            state[node] = 2
+            state[node] = BLACK
             stack.pop()
             continue
         if is_filtered(dep, filter_substring):

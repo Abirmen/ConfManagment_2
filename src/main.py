@@ -3,7 +3,7 @@
 import argparse
 import re
 import sys
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as element_tree
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -38,34 +38,52 @@ class ConfigError(ValueError):
     """Ошибка пользовательской конфигурации с кодом."""
 
     def __init__(self, code, message):
+        """Сохраняет код и текст ошибки параметров."""
         super().__init__(f"{code}: {message}")
         self.code = code
 
 
-def read_config(path):
-    """Читает XML и проверяет структуру полей."""
+def load_config_root(path):
+    """Читает XML-файл и возвращает корневой элемент."""
     try:
-        root = ET.parse(path).getroot()
+        return element_tree.parse(path).getroot()
     except (OSError, UnicodeError) as exc:
         raise ConfigError("E01", f"Не удаётся прочитать файл: {exc}") from exc
-    except ET.ParseError as exc:
+    except element_tree.ParseError as exc:
         raise ConfigError("E02", f"Неверный XML: {exc}") from exc
 
+
+def check_config_element(element, result):
+    """Проверяет один элемент конфигурации и сохраняет его значение."""
+    if element.tag not in FIELDS or element.attrib or len(element):
+        raise ConfigError("E03", f"Неожиданный элемент: {element.tag}")
+    if element.tag in result:
+        raise ConfigError("E10", f"Повтор параметра: {element.tag}")
+    result[element.tag] = (element.text or "").strip()
+
+
+def collect_config_fields(root):
+    """Проверяет корень и собирает поля конфигурации."""
     if root.tag != "config" or root.attrib:
         raise ConfigError("E03", "Корень должен быть <config> без атрибутов")
-
     result = {}
     for element in root:
-        if element.tag not in FIELDS or element.attrib or len(element):
-            raise ConfigError("E03", f"Неожиданный элемент: {element.tag}")
-        if element.tag in result:
-            raise ConfigError("E10", f"Повтор параметра: {element.tag}")
-        result[element.tag] = (element.text or "").strip()
+        check_config_element(element, result)
+    return result
 
-    missing = [field for field in FIELDS if field not in result]
+
+def find_missing_fields(config):
+    """Возвращает список отсутствующих обязательных полей."""
+    return [field for field in FIELDS if field not in config]
+
+
+def read_config(path):
+    """Читает XML и проверяет структуру полей."""
+    config = collect_config_fields(load_config_root(path))
+    missing = find_missing_fields(config)
     if missing:
         raise ConfigError("E03", "Отсутствуют поля: " + ", ".join(missing))
-    return result
+    return config
 
 
 def parse_boolean(config, field):

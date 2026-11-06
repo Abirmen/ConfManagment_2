@@ -336,9 +336,12 @@ def select_best_version(versions, version_req):
 class CargoGraphSource:
     """Кэширующий поставщик соседей графа для пакетов Cargo."""
 
-    def __init__(self, repository, root_package, root_version):
+    def __init__(self, repository, root_package, root_version=None):
         """Инициализирует кэши версий и прямых зависимостей."""
         self.repository = repository
+        if root_version is None:
+            available = fetch_available_versions(repository, root_package)
+            root_version = select_best_version(available, "*")
         self.resolved = {root_package: root_version}
         self.versions_cache = {}
         self.deps_cache = {}

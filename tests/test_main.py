@@ -1,4 +1,4 @@
-"""Модульные тесты всех этапов анализатора и визуализатора (этапы 1–5)."""
+"""Модульные тесты анализатора и визуализатора (этапы 1–5)."""
 
 import json
 import os
@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -28,9 +28,14 @@ from dep_graph import (
 from load_order import compute_load_order
 from main import (
     ConfigError,
+    build_arg_parser,
     main,
-    read_config,
-    validate_config,
+    resolve_options,
+    validate_filter,
+    validate_output_file,
+    validate_package_name,
+    validate_repository,
+    validate_version,
 )
 from svg_renderer import render_builtin_svg
 from visualizer import format_ascii_tree, generate_d2
@@ -39,142 +44,145 @@ from visualizer import format_ascii_tree, generate_d2
 ROOT = Path(__file__).resolve().parents[1]
 
 
-class ConfigTests(unittest.TestCase):
-    """Позитивные и негативные сценарии конфигурации и запуска CLI."""
+class FakeCargoSource:
+    """Подменяет сетевой источник Cargo заранее известным графом."""
 
-    def setUp(self):
-        self.sample = read_config(ROOT / "config.xml")
+    def __init__(self, repository, root_package, root_version=None):
+        """Сохраняет версии и зависимости тестового графа."""
+        self.resolved = {
+            "http": root_version or "1.1.0",
+            "bytes": "1.12.1",
+            "fnv": "1.0.7",
+            "itoa": "1.0.18",
+        }
+        self.graph = {
+            "http": ["bytes", "fnv", "itoa"],
+            "bytes": [],
+            "fnv": [],
+            "itoa": [],
+        }
+
+    def neighbors(self, package_name):
+        """Возвращает прямые зависимости пакета."""
+        return self.graph[package_name]
+
+
+class CliTests(unittest.TestCase):
+    """Проверяет работу CLI без файла конфигурации."""
 
     def run_cli_in_temp_cwd(self, argv):
         """Запускает CLI во временной папке для изоляции создаваемых SVG."""
-        output = StringIO()
+        output, errors = StringIO(), StringIO()
         prev_cwd = Path.cwd()
         with tempfile.TemporaryDirectory() as tmp_dir:
             os.chdir(tmp_dir)
             try:
-                with redirect_stdout(output):
+                with redirect_stdout(output), redirect_stderr(errors):
                     code = main(argv)
                 svg_files = {p.name: p.read_text("utf-8") for p in
                              Path(tmp_dir).glob("*.svg")}
             finally:
                 os.chdir(prev_cwd)
-        return code, output.getvalue(), svg_files
+        return code, output.getvalue(), errors.getvalue(), svg_files
 
-    def check_error(self, field, value, code):
-        """Проверяет код ошибки после замены одного параметра."""
-        config = self.sample.copy()
-        config[field] = value
-        with self.assertRaises(ConfigError) as context:
-            validate_config(config, ROOT / "config.xml")
-        self.assertEqual(context.exception.code, code)
+    def test_default_options_real_mode(self):
+        options = resolve_options(build_arg_parser().parse_args([]))
+        self.assertEqual(options["package_name"], "serde_derive")
+        self.assertEqual(options["repository"], "https://crates.io")
+        self.assertEqual(options["output_file"], "graph.svg")
+        self.assertFalse(options["test_mode"])
+        self.assertIsNone(options["package_version"])
+        self.assertTrue(options["ascii_tree"])
 
-    def test_valid(self):
-        self.assertTrue(validate_config(self.sample, ROOT / "config.xml"))
+    def test_default_options_test_mode(self):
+        options = resolve_options(
+            build_arg_parser().parse_args(["--test-mode"])
+        )
+        self.assertEqual(options["package_name"], "A")
+        self.assertEqual(options["package_version"], "1.0.0")
+        self.assertEqual(options["output_file"], "test-graph.svg")
+        self.assertTrue(options["test_mode"])
+        self.assertTrue(options["repository"].endswith(
+            "test-repository.txt"))
 
-    def test_valid_test_mode(self):
-        path = ROOT / "examples" / "config-test.xml"
-        config = read_config(path)
-        self.assertTrue(validate_config(config, path)["test_mode"])
-
-    def test_test_mode_requires_uppercase_latin_package(self):
-        config = read_config(ROOT / "examples" / "config-test.xml")
-        config["package_name"] = "serde"
-        path = ROOT / "examples" / "config-test.xml"
-        with self.assertRaises(ConfigError) as ctx:
-            validate_config(config, path)
-        self.assertEqual(ctx.exception.code, "E04")
-
-    def test_main_writes_svg_and_omits_ascii_when_disabled(self):
-        cfg = str(ROOT / "examples" / "config-test.xml")
-        code, text, svgs = self.run_cli_in_temp_cwd(["--config", cfg])
+    def test_test_mode_picture_and_tree_contain_versions(self):
+        code, text, _, svgs = self.run_cli_in_temp_cwd(
+            ["--test-mode", "--show-graph", "--load-order"]
+        )
         self.assertEqual(code, 0)
-        self.assertIn("Описание графа на языке D2:", text)
-        self.assertIn('"A" -> "C"', text)
-        self.assertNotIn("ASCII-дерево зависимостей:", text)
         self.assertIn("test-graph.svg", svgs)
+        self.assertIn('"A": "A (1.0.0)"', text)
+        self.assertIn('"A" -> "B"', text)
+        self.assertIn("A v1.0.0", text)
+        self.assertIn("v1.2.0", text)
+        self.assertIn("v1.0.0", svgs["test-graph.svg"])
         ET.fromstring(svgs["test-graph.svg"])
 
-    def test_main_prints_ascii_tree_when_enabled(self):
-        xml = (ROOT / "examples" / "config-diamond.xml").read_text("utf-8")
-        xml = xml.replace("<ascii_tree>false</ascii_tree>",
-                          "<ascii_tree>true</ascii_tree>")
-        with tempfile.TemporaryDirectory() as folder:
-            cfg_path = Path(folder) / "cfg.xml"
-            repo_src = (ROOT / "examples" / "test-repository.txt")
-            (Path(folder) / "test-repository.txt").write_text(
-                repo_src.read_text("utf-8"), encoding="utf-8"
-            )
-            cfg_path.write_text(xml, encoding="utf-8")
-            code, text, svgs = self.run_cli_in_temp_cwd(
-                ["--config", str(cfg_path), "--load-order", "--show-graph"]
+    def test_ascii_tree_can_be_disabled(self):
+        code, text, _, _ = self.run_cli_in_temp_cwd(
+            ["--test-mode", "--no-ascii-tree"]
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("ASCII-дерево зависимостей:", text)
+
+    def test_real_mode_uses_cli_values_and_shows_versions(self):
+        with patch("main.CargoGraphSource", FakeCargoSource):
+            code, text, _, svgs = self.run_cli_in_temp_cwd(
+                ["--package", "http", "--version", "1.1.0",
+                 "--output", "http-graph.svg"]
             )
         self.assertEqual(code, 0)
-        self.assertIn("ASCII-дерево зависимостей:", text)
-        self.assertIn("├── B", text)
-        self.assertIn("Порядок загрузки зависимостей", text)
-        self.assertIn("diamond-graph.svg", svgs)
+        self.assertIn('"http": "http (1.1.0)"', text)
+        self.assertIn("http v1.1.0", text)
+        self.assertIn("http-graph.svg", svgs)
+        svg = svgs["http-graph.svg"]
+        self.assertIn("v1.1.0", svg)
+        self.assertIn("v1.12.1", svg)
+        ET.fromstring(svg)
 
-    def test_e01_missing_file(self):
-        with self.assertRaisesRegex(ConfigError, "E01"):
-            read_config(ROOT / "missing.xml")
-
-    def test_e02_bad_xml(self):
-        self.check_xml("<config>", "E02")
-
-    def test_e03_missing_parameter(self):
-        self.check_xml("<config></config>", "E03")
-
-    def test_e03_extra_parameter(self):
-        xml = self.xml_text().replace("</config>", "<extra>x</extra></config>")
-        self.check_xml(xml, "E03")
+    def test_invalid_cli_arguments_return_error(self):
+        code, _, errors, _ = self.run_cli_in_temp_cwd(
+            ["--package", "bad package!"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("E04", errors)
 
     def test_e04_bad_name(self):
-        self.check_error("package_name", "bad package!", "E04")
+        with self.assertRaises(ConfigError) as ctx:
+            validate_package_name("bad package!", False)
+        self.assertEqual(ctx.exception.code, "E04")
 
-    def test_e05_bad_test_mode(self):
-        self.check_error("test_mode", "yes", "E05")
-
-    def test_e05_bad_ascii_tree(self):
-        self.check_error("ascii_tree", "1", "E05")
+    def test_e04_test_mode_requires_uppercase_latin(self):
+        with self.assertRaises(ConfigError) as ctx:
+            validate_package_name("serde", True)
+        self.assertEqual(ctx.exception.code, "E04")
 
     def test_e06_bad_url(self):
-        self.check_error("repository", "invalid-url", "E06")
+        with self.assertRaises(ConfigError) as ctx:
+            validate_repository("invalid-url", False)
+        self.assertEqual(ctx.exception.code, "E06")
 
     def test_e06_missing_test_repository(self):
-        config = self.sample.copy()
-        config["test_mode"] = "true"
-        config["package_name"] = "A"
-        config["repository"] = "missing-repo.txt"
-        with self.assertRaisesRegex(ConfigError, "E06"):
-            validate_config(config, ROOT / "config.xml")
+        with tempfile.TemporaryDirectory() as folder:
+            missing = str(Path(folder) / "missing-repo.txt")
+            with self.assertRaises(ConfigError) as ctx:
+                validate_repository(missing, True)
+        self.assertEqual(ctx.exception.code, "E06")
 
     def test_e07_bad_version(self):
-        self.check_error("package_version", "latest", "E07")
+        with self.assertRaises(ConfigError) as ctx:
+            validate_version("latest")
+        self.assertEqual(ctx.exception.code, "E07")
 
     def test_e08_bad_output(self):
-        self.check_error("output_file", "diagram.png", "E08")
+        with self.assertRaises(ConfigError) as ctx:
+            validate_output_file("diagram.png")
+        self.assertEqual(ctx.exception.code, "E08")
 
     def test_e09_invalid_filter(self):
-        self.check_error("filter_substring", "bad\x00x", "E09")
-
-    def test_e10_duplicate_parameter(self):
-        xml = self.xml_text().replace(
-            "</config>", "<package_name>A</package_name></config>"
-        )
-        self.check_xml(xml, "E10")
-
-    def xml_text(self):
-        """Возвращает эталонный XML."""
-        return (ROOT / "config.xml").read_text(encoding="utf-8")
-
-    def check_xml(self, content, code):
-        """Проверяет ошибку чтения временного XML-файла."""
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "config.xml"
-            path.write_text(content, encoding="utf-8")
-            with self.assertRaises(ConfigError) as context:
-                read_config(path)
-            self.assertEqual(context.exception.code, code)
+        with self.assertRaises(ConfigError) as ctx:
+            validate_filter("bad\x00x")
+        self.assertEqual(ctx.exception.code, "E09")
 
 
 class CargoRepoTests(unittest.TestCase):
@@ -241,6 +249,17 @@ class CargoRepoTests(unittest.TestCase):
         self.assertEqual(cycles, [])
         self.assertEqual(graph["mid"], ["leaf"])
 
+    def test_latest_root_version_when_omitted(self):
+        with patch(
+            "cargo_repo.fetch_available_versions",
+            return_value=["1.0.0", "2.1.0"],
+        ), patch(
+            "cargo_repo.fetch_direct_dependencies",
+            return_value=[],
+        ):
+            source = CargoGraphSource("https://crates.io", "root")
+        self.assertEqual(source.resolved["root"], "2.1.0")
+
     def test_e11_e12_e13_errors(self):
         raw = BytesIO(b'{"errors":[{"detail":"not found"}]}')
         err = HTTPError("https://crates.io", 404, "Not Found", {}, raw)
@@ -264,6 +283,13 @@ class GraphOrderAndVizTests(unittest.TestCase):
         result = compute_load_order(graph, cycles)
         self.assertEqual(result["order"], ["E", "G", "D", "F", "B", "C", "A"])
 
+    def test_test_repository_parses_versions(self):
+        repo = load_test_repository(ROOT / "examples" / "test-repository.txt")
+        self.assertEqual(repo.versions["A"], "1.0.0")
+        self.assertEqual(repo.versions["B"], "1.2.0")
+        self.assertEqual(repo.versions["G"], "3.1.4")
+        self.assertEqual(repo["A"], ["B", "C"])
+
     def test_cycle_detection_and_visualizers(self):
         path = ROOT / "examples" / "test-cycle-repository.txt"
         repo = load_test_repository(path)
@@ -276,6 +302,16 @@ class GraphOrderAndVizTests(unittest.TestCase):
         self.assertIn("D [цикл]", tree)
         svg = render_builtin_svg("A", graph, cycles)
         ET.fromstring(svg)
+
+    def test_versions_are_rendered_in_d2_svg_and_tree(self):
+        versions = {"A": "1.0.0", "B": "1.2.0"}
+        graph = {"A": ["B"], "B": []}
+        d2 = generate_d2("A", graph, (), versions)
+        self.assertIn('"A": "A (1.0.0)"', d2)
+        svg = render_builtin_svg("A", graph, (), versions)
+        self.assertIn("v1.0.0", svg)
+        self.assertIn("v1.2.0", svg)
+        self.assertIn("B v1.2.0", format_ascii_tree("A", graph, versions))
 
     def test_ascii_tree_marks_repeated_subtrees(self):
         graph = {"A": ["B", "C"], "B": ["D"], "C": ["B"], "D": []}
@@ -303,6 +339,13 @@ class GraphOrderAndVizTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             bad_file = Path(folder) / "bad.txt"
             bad_file.write_text("a_lower: B\n", encoding="utf-8")
+            with self.assertRaisesRegex(RepoError, "E15"):
+                load_test_repository(bad_file)
+
+    def test_invalid_test_repository_version_raises_e15(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bad_file = Path(folder) / "bad.txt"
+            bad_file.write_text("A@not-a-version: B\n", encoding="utf-8")
             with self.assertRaisesRegex(RepoError, "E15"):
                 load_test_repository(bad_file)
 

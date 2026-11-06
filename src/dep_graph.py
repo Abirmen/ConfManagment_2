@@ -6,9 +6,38 @@ from cargo_repo import RepoError
 
 
 TEST_PKG_RE = re.compile(r"^[A-Z]+$")
+TEST_VERSION_RE = re.compile(
+    r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
 STATE_NEW = 0
 STATE_ACTIVE = 1
 STATE_DONE = 2
+
+
+class TestRepository(dict):
+    """Словарь тестового репозитория, хранящий ещё и версии пакетов."""
+
+    def __init__(self):
+        """Создаёт пустой репозиторий с отдельной картой версий."""
+        super().__init__()
+        self.versions = {}
+
+
+def split_name_version(token, line_no, role):
+    """Разбирает запись вида 'A' или 'A@1.2.3' на имя и версию."""
+    name, _, version = token.partition("@")
+    name, version = name.strip(), version.strip()
+    if role == "package":
+        if not TEST_PKG_RE.fullmatch(name):
+            msg = f"Строка {line_no}: имя '{name}' не из заглавных букв A-Z"
+            raise RepoError("E15", msg)
+    elif not TEST_PKG_RE.fullmatch(name):
+        msg = f"Строка {line_no}: зависимость '{name}' не из букв A-Z"
+        raise RepoError("E15", msg)
+    if version and not TEST_VERSION_RE.fullmatch(version):
+        msg = f"Строка {line_no}: неверная версия '{version}'"
+        raise RepoError("E15", msg)
+    return name, version or None
 
 
 def parse_test_line(raw_line, line_no):
@@ -17,38 +46,38 @@ def parse_test_line(raw_line, line_no):
         msg = f"Строка {line_no}: ожидается формат 'A: B, C'"
         raise RepoError("E15", msg)
     left, right = raw_line.split(":", 1)
-    pkg = left.strip()
-    if not TEST_PKG_RE.fullmatch(pkg):
-        msg = f"Строка {line_no}: имя '{pkg}' не из заглавных букв A-Z"
-        raise RepoError("E15", msg)
-    if not right.strip():
-        return pkg, []
+    pkg, pkg_version = split_name_version(left, line_no, "package")
     deps = []
-    for part in right.split(","):
-        dep = part.strip()
-        if not TEST_PKG_RE.fullmatch(dep):
-            msg = f"Строка {line_no}: зависимость '{dep}' не из букв A-Z"
-            raise RepoError("E15", msg)
-        if dep not in deps:
-            deps.append(dep)
-    return pkg, deps
+    dep_versions = {}
+    if right.strip():
+        for part in right.split(","):
+            dep, dep_version = split_name_version(part, line_no, "dependency")
+            if dep not in deps:
+                deps.append(dep)
+            if dep_version and dep not in dep_versions:
+                dep_versions[dep] = dep_version
+    return pkg, deps, pkg_version, dep_versions
 
 
 def load_test_repository(path):
-    """Читает описание графа тестового репозитория из файла."""
+    """Читает описание графа и версий пакетов из тестового файла."""
     try:
         content = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise RepoError("E15", f"Ошибка чтения репозитория: {exc}") from exc
-    repo = {}
+    repo = TestRepository()
     for line_no, raw in enumerate(content.splitlines(), start=1):
         clean = raw.split("#", 1)[0].strip()
         if not clean:
             continue
-        pkg, deps = parse_test_line(clean, line_no)
+        pkg, deps, pkg_version, dep_versions = parse_test_line(clean, line_no)
         if pkg in repo:
             raise RepoError("E15", f"Строка {line_no}: повтор пакета '{pkg}'")
         repo[pkg] = deps
+        for dep, dep_version in dep_versions.items():
+            repo.versions.setdefault(dep, dep_version)
+        if pkg_version:
+            repo.versions[pkg] = pkg_version
     return repo
 
 
